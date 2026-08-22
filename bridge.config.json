@@ -1,0 +1,27 @@
+{
+  "TapAdapterName": "Industrial-TAP",
+  "PeerDiscovery": "Netbird",
+  "RemotePeer": "cesar-router.sentros.cloud",
+  "EncapsulationMode": "Vxlan",
+  "VxlanVni": 4096,
+  "GreKey": 0,
+  "EnableBroadIndustrialFilter": true,
+  "AutoCreateTapAdapter": false,
+
+  "EnforceTapMtu": true,
+  "TapAddressMode": "DHCP",
+  "TapStaticAddress": "192.168.77.50",
+  "TapStaticPrefixLength": 24,
+  "IsolateTapRouting": true,
+  "DisableIpv6OnTap": true,
+
+  "EnableMacLearning": true,
+  "MacAgingSeconds": 300,
+  "EnableLoopDetection": true,
+  "LoopProbeSeconds": 5,
+  "StopOnLoopDetected": true,
+
+  "LogFilePath": "wgl2bridge.log.txt",
+  "ConsoleLogLevel": "Information",
+  "FileLogLevel": "Debug"
+}
