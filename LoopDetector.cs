@@ -23,20 +23,20 @@ public sealed class LoopDetector
     private readonly TapAdapter _tap;
     private readonly TimeSpan _interval;
     private readonly bool _stopOnDetection;
-    private readonly Action<string> _log;
+    private readonly BridgeLog _log;
     private readonly CancellationTokenSource _shutdown;
     private readonly byte[] _instanceId = Guid.NewGuid().ToByteArray();
     private readonly byte[] _tunnelBuffer;
     private readonly byte[] _tapBuffer;
 
-    public bool LoopDetected { get; private set; }
+    private bool LoopDetected { get; set; }
 
     public LoopDetector(
         IBridgeTransport transport,
         TapAdapter tap,
         TimeSpan interval,
         bool stopOnDetection,
-        Action<string> log,
+        BridgeLog log,
         CancellationTokenSource shutdown)
     {
         _transport = transport;
@@ -99,12 +99,11 @@ public sealed class LoopDetector
         {
             LoopDetected = true;
             var origin = (BridgePort)frame[PortOffset];
-            _log($"LOOP DETECTED: probe sent on {origin} returned on {ingress}. " +
-                 "A second Layer 2 path exists between the bridged segments.");
+            _log.Warning($"LOOP DETECTED: probe sent on {origin} returned on {ingress}. A second Layer 2 path exists between the bridged segments.");
 
             if (_stopOnDetection)
             {
-                _log("Stopping the bridge to prevent a broadcast storm. Remove the redundant path, then restart.");
+                _log.Warning("Stopping the bridge to prevent a broadcast storm. Remove the redundant path, then restart.");
                 _shutdown.Cancel();
             }
         }
@@ -133,7 +132,7 @@ public sealed class LoopDetector
         }
         catch (Exception ex)
         {
-            _log($"Loop detector stopped: {ex.Message}");
+            _log.Warning($"Loop detector stopped: {ex.Message}");
         }
         finally
         {

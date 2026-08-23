@@ -21,6 +21,7 @@ public static class Program
     private static long _framesDropped;
     private static ILoggerFactory? _loggerFactory;
     private static ILogger? _logger;
+    private static BridgeLog? _log;
 
     public static async Task<int> Main(string[] args)
     {
@@ -47,7 +48,7 @@ public static class Program
         ConsoleCancelEventHandler cancelKeyHandler = (_, e) =>
         {
             e.Cancel = true; // Prevent an abrupt kill so the TAP handle is released cleanly.
-            Log("Shutdown requested, draining I/O...");
+            LogInfo("Shutdown requested, draining I/O...");
             RequestShutdown();
         };
         EventHandler processExitHandler = (_, _) => RequestShutdown();
@@ -61,32 +62,33 @@ public static class Program
         {
             BridgeConfig config = BridgeConfig.Load(configPath);
             InitializeLogging(config);
-            Log($"Configuration loaded from {configPath}");
+            LogInfo($"Configuration loaded from {configPath}");
+            LogDebug($"Configuration: adapter '{config.TapAdapterName}', discovery {config.PeerDiscovery}, encapsulation {config.EncapsulationMode}, port {config.EffectivePort}, VNI {config.VxlanVni}, GRE key {config.GreKey}.");
 
             if (!TapProvisioner.IsElevated)
             {
-                Log("WARNING: not running elevated. Opening the raw TAP device requires administrator rights.");
+                LogWarning("not running elevated. Opening the raw TAP device requires administrator rights.");
             }
 
             // ---- 1. TAP adapter preflight and raw Layer 2 attachment ----
-            await TapProvisioner.EnsureAdapterExistsAsync(config, Log, cts.Token).ConfigureAwait(false);
+            await TapProvisioner.EnsureAdapterExistsAsync(config, _log!, cts.Token).ConfigureAwait(false);
             tap = TapAdapter.Open(config.TapAdapterName);
-            Log($"TAP adapter '{tap.AdapterName}' opened ({tap.DeviceGuid}), media state forced to connected.");
+            LogInfo($"TAP adapter '{tap.AdapterName}' opened ({tap.DeviceGuid}), media state forced to connected.");
 
-            Log(config.EnableBroadIndustrialFilter
+            LogInfo(config.EnableBroadIndustrialFilter
                 ? "Broad-Industrial-Pass filter ENABLED (ARP/PROFINET/POWERLINK/EtherCAT/GOOSE/IP allowed; mDNS, LLMNR, SSDP, NetBIOS, WS-Discovery dropped)."
                 : "Filter DISABLED - all Layer 2 traffic is bridged verbatim.");
 
             MacTable? macTable = config.EnableMacLearning
                 ? new MacTable(TimeSpan.FromSeconds(config.MacAgingSeconds))
                 : null;
-            Log(macTable is not null
+            LogInfo(macTable is not null
                 ? $"MAC learning ENABLED (aging {config.MacAgingSeconds}s); known-local unicast is not flooded."
                 : "MAC learning DISABLED - every admitted frame floods both ways.");
 
             if (config.EnableLoopDetection)
             {
-                Log($"Loop detection ENABLED (probe every {config.LoopProbeSeconds}s).");
+                LogInfo($"Loop detection ENABLED (probe every {config.LoopProbeSeconds}s).");
             }
 
             // ---- 2. Bridge sessions with tunnel-loss recovery ----
@@ -109,7 +111,7 @@ public static class Program
 
                     if (lastFailure is not null)
                     {
-                        Log($"Tunnel recovered after {waitingSince.Elapsed:mm\\:ss} ({retryCount} attempts).");
+                        LogInfo($"Tunnel recovered after {waitingSince.Elapsed:mm\\:ss} ({retryCount} attempts).");
                         lastFailure = null;
                         retryCount = 0;
                     }
@@ -131,11 +133,11 @@ public static class Program
                         if (lastFailure is null)
                         {
                             waitingSince.Restart();
-                            Log($"Tunnel lost: {failure}");
+                            LogWarning($"Tunnel lost: {failure}");
                         }
                         else
                         {
-                            Log($"Tunnel still down, failure changed: {failure}");
+                            LogWarning($"Tunnel still down, failure changed: {failure}");
                         }
 
                         lastFailure = failure;
@@ -143,6 +145,7 @@ public static class Program
 
                     retryCount++;
                     firstSession = false;
+                    LogDebug($"Reconnect attempt {retryCount}: waiting {config.ReconnectDelaySeconds}s before re-binding the tunnel.");
 
                     try
                     {
@@ -156,12 +159,12 @@ public static class Program
             }
 
             await SafeAwait(stats).ConfigureAwait(false);
-            Log("Bridge stopped.");
+            LogInfo("Bridge stopped.");
             return 0;
         }
         catch (OperationCanceledException)
         {
-            Log("Bridge stopped.");
+            LogInfo("Bridge stopped.");
             return 0;
         }
         catch (InvalidOperationException ex) when (
@@ -169,12 +172,12 @@ public static class Program
             ex.Message.Contains("NetBird peer", StringComparison.OrdinalIgnoreCase) ||
             ex.Message.Contains("remote bridge", StringComparison.OrdinalIgnoreCase))
         {
-            Log(ex.Message);
+            LogError(ex.Message);
             return 1;
         }
         catch (Exception ex)
         {
-            Log($"FATAL: {ex.Message}");
+            LogError(ex.Message);
             return 1;
         }
         finally
@@ -186,6 +189,7 @@ public static class Program
             _loggerFactory?.Dispose();
             _loggerFactory = null;
             _logger = null;
+            _log = null;
         }
     }
 
@@ -239,7 +243,7 @@ public static class Program
                 {
                     // The configured peer is not in the mesh right now (offline or renamed); let the
                     // operator pick from what NetBird currently reports instead of failing.
-                    Log($"Configured peer '{config.RemotePeer}' is not in the NetBird mesh.");
+                    LogInfo($"Configured peer '{config.RemotePeer}' is not in the NetBird mesh.");
                     peer = netbird.SelectPeerInteractively();
                 }
                 else
@@ -251,11 +255,16 @@ public static class Program
                 state.RemoteAddress = peer.Address;
                 state.AdapterName ??= netbird.InterfaceName;
 
-                Log($"NetBird: local {netbird.LocalFqdn} [{localTunnelIp}] -> peer {peer.Fqdn} [{peer.Address}] ({peer.Status})");
+                LogInfo($"NetBird: local {netbird.LocalFqdn} [{localTunnelIp}] -> peer {peer.Fqdn} [{peer.Address}] ({peer.Status})");
                 if (!string.Equals(peer.Status, "Connected", StringComparison.OrdinalIgnoreCase))
                 {
-                    Log($"WARNING: NetBird peer '{peer.Fqdn}' is {peer.Status}; frames will be dropped until it connects.");
+                    LogWarning($"NetBird peer '{peer.Fqdn}' is {peer.Status}; frames will be dropped until it connects.");
                 }
+            }
+
+            else
+            {
+                LogDebug($"Reusing cached NetBird peer {state.RemoteAddress} on adapter '{state.AdapterName}'.");
             }
 
             remoteTunnelIp = state.RemoteAddress;
@@ -276,7 +285,7 @@ public static class Program
         localTunnelIp ??= WireGuardInterface.GetLocalTunnelAddress(tunnel);
 
         using IBridgeTransport transport = BridgeTransportFactory.Create(config, localTunnelIp, remoteTunnelIp);
-        Log($"{(firstSession ? "Encapsulation" : "Tunnel re-established")}: {transport.Describe()} (bound to '{tunnel.Name}')");
+        LogInfo($"{(firstSession ? "Encapsulation" : "Tunnel re-established")}: {transport.Describe()} (bound to '{tunnel.Name}')");
 
         // A reconnect can change the tunnel MTU (different relay path), so the TAP MTU is
         // re-derived and re-applied every session, not only at process start.
@@ -284,7 +293,7 @@ public static class Program
         config.EffectiveTapMtu = config.TapMtuOverride ?? BridgeConfig.FallbackTapMtu;
         ApplyDerivedTapMtu(config, transport, tunnelMtu);
 
-        await TapNetworkConfigurator.ApplyAsync(config, Log, cancellationToken).ConfigureAwait(false);
+        await TapNetworkConfigurator.ApplyAsync(config, _log!, cancellationToken).ConfigureAwait(false);
         await CheckMtuAsync(config, tap, tunnelMtu, cancellationToken).ConfigureAwait(false);
 
         // Session-scoped cancellation: a tunnel failure stops this session's pumps without
@@ -294,12 +303,12 @@ public static class Program
         // The loop detector holds the transport, so it is rebuilt per session.
         LoopDetector? loopDetector = config.EnableLoopDetection
             ? new LoopDetector(transport, tap, TimeSpan.FromSeconds(config.LoopProbeSeconds),
-                config.StopOnLoopDetected, Log, shutdown)
+                config.StopOnLoopDetected, _log!, shutdown)
             : null;
 
         if (firstSession)
         {
-            Log("Bridge running. Press Ctrl+C to stop.");
+            LogInfo("Bridge running. Press Ctrl+C to stop.");
         }
 
         // ---- Bidirectional pump ----
@@ -409,7 +418,7 @@ public static class Program
                 }
                 catch (SocketException ex) when (ex.SocketErrorCode is SocketError.MessageSize)
                 {
-                    Log($"Frame of {length} bytes exceeds the tunnel MTU. Lower the TAP MTU to {config.EffectiveTapMtu}.");
+                    LogWarning($"Frame of {length} bytes exceeds the tunnel MTU. Lower the TAP MTU to {config.EffectiveTapMtu}.");
                 }
                 catch (SocketException ex) when (IsTransient(ex))
                 {
@@ -513,7 +522,7 @@ public static class Program
 
         if (tunnelMtu <= 0)
         {
-            Log($"Tunnel MTU is unknown; falling back to a TAP MTU of {config.EffectiveTapMtu}.");
+            LogWarning($"Tunnel MTU is unknown; falling back to a TAP MTU of {config.EffectiveTapMtu}.");
             return;
         }
 
@@ -528,12 +537,12 @@ public static class Program
         int derived = tunnelMtu - outerOverhead - InnerEthernetHeader;
         if (derived < 576)
         {
-            Log($"WARNING: tunnel MTU {tunnelMtu} leaves only {derived} bytes for the TAP adapter; keeping {config.EffectiveTapMtu}.");
+            LogWarning($"tunnel MTU {tunnelMtu} leaves only {derived} bytes for the TAP adapter; keeping {config.EffectiveTapMtu}.");
             return;
         }
 
         config.EffectiveTapMtu = derived;
-        Log($"Derived TAP MTU {derived} (tunnel {tunnelMtu} - {outerOverhead} encapsulation - {InnerEthernetHeader} Ethernet).");
+        LogInfo($"Derived TAP MTU {derived} (tunnel {tunnelMtu} - {outerOverhead} encapsulation - {InnerEthernetHeader} Ethernet).");
     }
 
     private static async Task CheckMtuAsync(BridgeConfig config, TapAdapter tap, int tunnelMtu, CancellationToken cancellationToken)
@@ -550,12 +559,12 @@ public static class Program
 
         tapMtu ??= tap.TryGetDriverMtu();
 
-        Log($"MTU report: TAP={(tapMtu is > 0 ? tapMtu.ToString() : "unknown")}, tunnel={(tunnelMtu > 0 ? tunnelMtu.ToString() : "unknown")}");
+        LogInfo($"MTU report: TAP={(tapMtu is > 0 ? tapMtu.ToString() : "unknown")}, tunnel={(tunnelMtu > 0 ? tunnelMtu.ToString() : "unknown")}");
 
         if (tapMtu is null or <= 0 || tapMtu > config.EffectiveTapMtu)
         {
-            Log($"WARNING: set the '{config.TapAdapterName}' adapter MTU to {config.EffectiveTapMtu} to avoid fragmentation inside the tunnel.");
-            Log($"         netsh interface ipv4 set subinterface \"{config.TapAdapterName}\" mtu={config.EffectiveTapMtu} store=persistent");
+            LogWarning($"set the '{config.TapAdapterName}' adapter MTU to {config.EffectiveTapMtu} to avoid fragmentation inside the tunnel.");
+            LogWarning($"netsh interface ipv4 set subinterface \"{config.TapAdapterName}\" mtu={config.EffectiveTapMtu} store=persistent");
         }
     }
 
@@ -626,7 +635,7 @@ public static class Program
                 // Quiet when idle: only the ticks where something actually moved are interesting.
                 if (framesOut != lastOut || framesIn != lastIn || framesDropped != lastDropped)
                 {
-                    Log($"[{uptime.Elapsed:hh\\:mm\\:ss}] out={framesOut} in={framesIn} dropped={framesDropped}");
+                    LogInfo($"[{uptime.Elapsed:hh\\:mm\\:ss}] out={framesOut} in={framesIn} dropped={framesDropped}");
                     lastOut = framesOut;
                     lastIn = framesIn;
                     lastDropped = framesDropped;
@@ -688,9 +697,18 @@ public static class Program
         });
 
         _logger = _loggerFactory.CreateLogger("WGL2Bridge");
+        _log = new BridgeLog(_logger);
     }
 
-    private static void Log(string message)
+    private static void LogInfo(string message) => Write(LogLevel.Information, message);
+
+    private static void LogDebug(string message) => Write(LogLevel.Debug, message);
+
+    private static void LogWarning(string message) => Write(LogLevel.Warning, message);
+
+    private static void LogError(string message) => Write(LogLevel.Error, message);
+
+    private static void Write(LogLevel level, string message)
     {
         if (_logger is null)
         {
@@ -698,18 +716,6 @@ public static class Program
             return;
         }
 
-        if (message.StartsWith("FATAL:", StringComparison.OrdinalIgnoreCase))
-        {
-            _logger.LogError("{Message}", message);
-            return;
-        }
-
-        if (message.StartsWith("WARNING:", StringComparison.OrdinalIgnoreCase))
-        {
-            _logger.LogWarning("{Message}", message);
-            return;
-        }
-
-        _logger.LogInformation("{Message}", message);
+        _logger.Log(level, "{Message}", message);
     }
 }

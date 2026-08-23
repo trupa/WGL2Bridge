@@ -108,7 +108,6 @@ Create the TAP adapter once, in an elevated PowerShell:
 
 ```powershell
 & "C:\Program Files\OpenVPN\bin\tapctl.exe" create --name "Industrial-TAP"
-Enable-NetAdapter -Name "Industrial-TAP"
 ```
 
 Give it a static IP in the remote PLC subnet, with **no gateway** (otherwise Windows parks it in
@@ -150,15 +149,15 @@ Stats are emitted every 30 s only when counters change:
 
 Format: `[uptime hh:mm:ss] out=<frames sent to tunnel> in=<frames received from tunnel> dropped=<frames filtered>`.
 
-Set `"AutoCreateTapAdapter": true` and the bridge will run the `tapctl` + MTU + enable steps itself
-when the adapter is missing (elevated only).
+Set `"AutoCreateTapAdapter": true` and the bridge will create the adapter itself via `tapctl` when it
+is missing (elevated only); the MTU is applied by the bridge at startup.
 
 ---
 
 ## 4. Configuration
 
 `bridge.config.json`, loaded from the path given as the first argument, or from the executable
-directory. Only four keys are normally needed — everything else is discovered at runtime.
+directory. Only the keys below are normally needed — everything else is discovered at runtime.
 
 ```json
 {
@@ -196,6 +195,19 @@ Optional keys, add only when needed:
 | `LogFilePath` | `wgl2bridge.log.txt` | Text log path. Relative paths are resolved under the executable directory. |
 | `ConsoleLogLevel` | `Information` | Minimum level written to console (`Trace`..`Critical`, `None`). |
 | `FileLogLevel` | `Debug` | Minimum level written to the file sink (`Trace`..`Critical`, `None`). |
+
+### Logging
+
+The bridge writes the same events to the console and, by default, to `wgl2bridge.log.txt` next to
+the executable. The two sinks are filtered independently:
+
+- `ConsoleLogLevel` (default `Information`) — minimum level shown on the console.
+- `FileLogLevel` (default `Debug`) — minimum level written to the log file.
+
+Levels are `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical`, or `None`. Set a sink to
+`Debug` (or `Trace`) to see diagnostic detail such as the resolved configuration, reconnect retries,
+and cached NetBird peer reuse. `LogFilePath` accepts an absolute path or a path relative to the
+executable directory.
 
 ### Tunnel recovery
 

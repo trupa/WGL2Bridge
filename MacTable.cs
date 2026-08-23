@@ -29,8 +29,6 @@ public sealed class MacTable(TimeSpan agingTime, int capacity = 4096)
         public readonly long Timestamp = timestamp;
     }
 
-    public int Count => _entries.Count;
-
     /// <summary>
     /// Learns the source address and decides whether the frame may cross to the other port.
     /// </summary>

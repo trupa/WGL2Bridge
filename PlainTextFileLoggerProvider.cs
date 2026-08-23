@@ -3,11 +3,10 @@ using Microsoft.Extensions.Logging;
 
 namespace WGL2Bridge;
 
-internal sealed class PlainTextFileLoggerProvider : ILoggerProvider, ISupportExternalScope
+internal sealed class PlainTextFileLoggerProvider : ILoggerProvider
 {
     private readonly StreamWriter _writer;
     private readonly object _gate = new();
-    private IExternalScopeProvider _scopeProvider = new LoggerExternalScopeProvider();
     private bool _disposed;
 
     public PlainTextFileLoggerProvider(string path)
@@ -31,11 +30,6 @@ internal sealed class PlainTextFileLoggerProvider : ILoggerProvider, ISupportExt
 
     public ILogger CreateLogger(string categoryName) => new PlainTextFileLogger(this, categoryName);
 
-    public void SetScopeProvider(IExternalScopeProvider scopeProvider)
-    {
-        _scopeProvider = scopeProvider;
-    }
-
     public void Dispose()
     {
         if (_disposed)
@@ -50,7 +44,7 @@ internal sealed class PlainTextFileLoggerProvider : ILoggerProvider, ISupportExt
         }
     }
 
-    private void Write(LogLevel logLevel, string categoryName, EventId eventId, string message, Exception? exception)
+    private void Write(LogLevel logLevel, string categoryName, string message, Exception? exception)
     {
         lock (_gate)
         {
@@ -67,7 +61,7 @@ internal sealed class PlainTextFileLoggerProvider : ILoggerProvider, ISupportExt
     private sealed class PlainTextFileLogger(PlainTextFileLoggerProvider provider, string categoryName) : ILogger
     {
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull
-            => provider._scopeProvider.Push(state);
+            => null;
 
         public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
 
@@ -85,7 +79,7 @@ internal sealed class PlainTextFileLoggerProvider : ILoggerProvider, ISupportExt
                 return;
             }
 
-            provider.Write(logLevel, categoryName, eventId, message, exception);
+            provider.Write(logLevel, categoryName, message, exception);
         }
     }
 }

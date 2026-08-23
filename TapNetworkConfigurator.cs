@@ -23,7 +23,7 @@ public enum TapAddressMode
 [SupportedOSPlatform("windows")]
 public static class TapNetworkConfigurator
 {
-    public static async Task ApplyAsync(BridgeConfig config, Action<string> log, CancellationToken cancellationToken)
+    public static async Task ApplyAsync(BridgeConfig config, BridgeLog log, CancellationToken cancellationToken)
     {
         string adapter = config.TapAdapterName;
 
@@ -32,7 +32,7 @@ public static class TapNetworkConfigurator
             await RunAsync("netsh",
                 ["interface", "ipv4", "set", "subinterface", adapter, $"mtu={config.EffectiveTapMtu}", "store=persistent"],
                 log, cancellationToken).ConfigureAwait(false);
-            log($"TAP MTU set to {config.EffectiveTapMtu}.");
+            log.Info($"TAP MTU set to {config.EffectiveTapMtu}.");
         }
 
         // Routing isolation must be set BEFORE addressing: once a DHCP lease lands, its default
@@ -45,7 +45,7 @@ public static class TapNetworkConfigurator
             await RunAsync("netsh",
                 ["interface", "ipv4", "set", "interface", adapter, "ignoredefaultroutes=enabled", "metric=9999"],
                 log, cancellationToken).ConfigureAwait(false);
-            log("TAP routing isolated: default routes ignored, interface metric 9999.");
+            log.Info("TAP routing isolated: default routes ignored, interface metric 9999.");
         }
 
         switch (config.TapAddressMode)
@@ -54,7 +54,7 @@ public static class TapNetworkConfigurator
                 await RunAsync("netsh",
                     ["interface", "ipv4", "set", "address", adapter, "source=dhcp"],
                     log, cancellationToken).ConfigureAwait(false);
-                log("TAP address mode: DHCP (leases from the remote segment).");
+                log.Info("TAP address mode: DHCP (leases from the remote segment).");
                 break;
 
             case TapAddressMode.Static:
@@ -63,7 +63,7 @@ public static class TapNetworkConfigurator
                 await RunAsync("netsh",
                     ["interface", "ipv4", "set", "address", adapter, "static", config.TapStaticAddress!, mask],
                     log, cancellationToken).ConfigureAwait(false);
-                log($"TAP address mode: static {config.TapStaticAddress}/{config.TapStaticPrefixLength} (no gateway).");
+                log.Info($"TAP address mode: static {config.TapStaticAddress}/{config.TapStaticPrefixLength} (no gateway).");
                 break;
         }
 
@@ -108,7 +108,7 @@ public static class TapNetworkConfigurator
 
             if (enabledCount == 0)
             {
-                log("IPv6 and link-layer discovery bindings already disabled on the TAP adapter.");
+                log.Info("IPv6 and link-layer discovery bindings already disabled on the TAP adapter.");
             }
             else
             {
@@ -119,7 +119,7 @@ public static class TapNetworkConfigurator
                         "-ComponentID ms_tcpip6,ms_lltdio,ms_rspndr -ErrorAction SilentlyContinue"
                     ],
                     log, cancellationToken).ConfigureAwait(false);
-                log("IPv6 and link-layer discovery bindings disabled on the TAP adapter.");
+                log.Info("IPv6 and link-layer discovery bindings disabled on the TAP adapter.");
             }
         }
     }
@@ -130,7 +130,7 @@ public static class TapNetworkConfigurator
         return new IPAddress([(byte)(mask >> 24), (byte)(mask >> 16), (byte)(mask >> 8), (byte)mask]).ToString();
     }
 
-    private static async Task RunAsync(string fileName, string[] arguments, Action<string> log, CancellationToken cancellationToken)
+    private static async Task RunAsync(string fileName, string[] arguments, BridgeLog log, CancellationToken cancellationToken)
     {
         var startInfo = new ProcessStartInfo(fileName)
         {
@@ -158,7 +158,7 @@ public static class TapNetworkConfigurator
         if (process.ExitCode != 0)
         {
             // Adapter configuration is best-effort: a failure here should not stop the bridge.
-            log($"WARNING: '{Path.GetFileName(fileName)} {string.Join(' ', arguments)}' returned {process.ExitCode}. {error} {output}".TrimEnd());
+            log.Warning($"'{Path.GetFileName(fileName)} {string.Join(' ', arguments)}' returned {process.ExitCode}. {error} {output}".TrimEnd());
         }
     }
 }

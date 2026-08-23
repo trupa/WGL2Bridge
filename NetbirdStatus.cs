@@ -38,8 +38,6 @@ public sealed class NetbirdStatus
     /// <summary>NetBird's WireGuard interface name ("wt0" on Windows/userspace, configurable on Linux).</summary>
     public string InterfaceName { get; }
 
-    public IReadOnlyList<NetbirdPeer> Peers => _peers;
-
     private static readonly string[] CliSearchPaths =
     [
         @"C:\Program Files\Netbird\netbird.exe",
@@ -80,7 +78,7 @@ public sealed class NetbirdStatus
         return Parse(json);
     }
 
-    public static NetbirdStatus Parse(string json)
+    private static NetbirdStatus Parse(string json)
     {
         using JsonDocument document = JsonDocument.Parse(json);
         JsonElement root = document.RootElement;

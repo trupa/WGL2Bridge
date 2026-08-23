@@ -32,14 +32,14 @@ public static class TapProvisioner
     /// <summary>
     /// Ensures the configured TAP adapter exists, provisioning it when allowed.
     /// </summary>
-    public static async Task EnsureAdapterExistsAsync(BridgeConfig config, Action<string> log, CancellationToken cancellationToken)
+    public static async Task EnsureAdapterExistsAsync(BridgeConfig config, BridgeLog log, CancellationToken cancellationToken)
     {
         if (NativeMethods.TryResolveAdapterGuidByName(config.TapAdapterName) is not null)
         {
             return;
         }
 
-        log($"TAP adapter '{config.TapAdapterName}' does not exist.");
+        log.Info($"TAP adapter '{config.TapAdapterName}' does not exist.");
 
         string? tapCtl = FindTapCtl();
 
@@ -50,7 +50,7 @@ public static class TapProvisioner
                 $"TAP adapter '{config.TapAdapterName}' is missing and could not be created automatically.");
         }
 
-        log($"Creating TAP adapter with {tapCtl} ...");
+        log.Info($"Creating TAP adapter with {tapCtl} ...");
         await RunAsync(tapCtl, ["create", "--name", config.TapAdapterName], log, cancellationToken).ConfigureAwait(false);
 
         // Wait for the registry entry so the TAP driver can open the device.
@@ -74,32 +74,31 @@ public static class TapProvisioner
 
         // tapctl creates the adapter already enabled; MTU is applied by TapNetworkConfigurator
         // at the start of every bridge session, so no additional configuration is needed here.
-        log($"TAP adapter '{config.TapAdapterName}' created.");
+        log.Info($"TAP adapter '{config.TapAdapterName}' created.");
     }
 
-    private static void PrintManualInstructions(BridgeConfig config, string? tapCtl, Action<string> log)
+    private static void PrintManualInstructions(BridgeConfig config, string? tapCtl, BridgeLog log)
     {
-        log("");
-        log("Run the following in an ELEVATED PowerShell to provision the adapter:");
+        log.Info("");
+        log.Info("Run the following in an ELEVATED PowerShell to provision the adapter:");
 
         if (tapCtl is null)
         {
-            log("  1. Install the OpenVPN 'TAP Virtual Ethernet Adapter' component (tap-windows6 driver).");
-            log("     Note: WireGuard's Wintun adapter is Layer 3 only and cannot be used as the source TAP.");
-            log($"  2. & \"C:\\Program Files\\OpenVPN\\bin\\tapctl.exe\" create --name \"{config.TapAdapterName}\"");
+            log.Info("  1. Install the OpenVPN 'TAP Virtual Ethernet Adapter' component (tap-windows6 driver).");
+            log.Info("     Note: WireGuard's Wintun adapter is Layer 3 only and cannot be used as the source TAP.");
+            log.Info($"  2. & \"C:\\Program Files\\OpenVPN\\bin\\tapctl.exe\" create --name \"{config.TapAdapterName}\"");
         }
         else
         {
-            log($"  & \"{tapCtl}\" create --name \"{config.TapAdapterName}\"");
+            log.Info($"  & \"{tapCtl}\" create --name \"{config.TapAdapterName}\"");
         }
 
-        log($"  Enable-NetAdapter -Name \"{config.TapAdapterName}\"");
-        log("");
-        log($"Alternatively set \"AutoCreateTapAdapter\": true in the configuration and run this bridge elevated.");
+        log.Info("");
+        log.Info($"Alternatively set \"AutoCreateTapAdapter\": true in the configuration and run this bridge elevated.");
 
         if (!IsElevated)
         {
-            log("This process is NOT running elevated; raw TAP access requires administrator rights.");
+            log.Warning("This process is NOT running elevated; raw TAP access requires administrator rights.");
         }
     }
 
@@ -138,7 +137,7 @@ public static class TapProvisioner
         return null;
     }
 
-    private static async Task RunAsync(string fileName, string[] arguments, Action<string> log, CancellationToken cancellationToken)
+    private static async Task RunAsync(string fileName, string[] arguments, BridgeLog log, CancellationToken cancellationToken)
     {
         var startInfo = new ProcessStartInfo(fileName)
         {
@@ -165,7 +164,7 @@ public static class TapProvisioner
 
         if (output.Length > 0)
         {
-            log($"  {fileName}: {output}");
+            log.Info($"  {fileName}: {output}");
         }
 
         if (process.ExitCode != 0)
