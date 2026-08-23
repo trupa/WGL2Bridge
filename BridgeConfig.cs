@@ -11,10 +11,6 @@ namespace WGL2Bridge;
     AllowTrailingCommas = true,
     NumberHandling = JsonNumberHandling.AllowReadingFromString,
     GenerationMode = JsonSourceGenerationMode.Metadata)]
-[JsonSerializable(typeof(BridgeConfig))]
-internal partial class BridgeConfigJsonContext : JsonSerializerContext
-{
-}
 
 /// <summary>
 /// Bridge configuration, loadable from a JSON document on disk.
@@ -119,14 +115,6 @@ public sealed class BridgeConfig
     [JsonIgnore]
     public int EffectivePort => EncapsulationPort ?? (EncapsulationMode == EncapsulationMode.Vxlan ? 4789 : 55555);
 
-    private static readonly JsonSerializerOptions Options = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        ReadCommentHandling = JsonCommentHandling.Skip,
-        AllowTrailingCommas = true,
-        NumberHandling = JsonNumberHandling.AllowReadingFromString
-    };
-
     public static BridgeConfig Load(string path)
     {
         if (!File.Exists(path))
@@ -141,17 +129,6 @@ public sealed class BridgeConfig
                               ?? throw new InvalidDataException($"Configuration file '{path}' is empty or invalid.");
         config.Validate();
         return config;
-
-        //if (!File.Exists(path))
-        //{
-        //    throw new FileNotFoundException($"Configuration file not found: {path}", path);
-        //}
-
-        //using FileStream stream = File.OpenRead(path);
-        //BridgeConfig config = JsonSerializer.Deserialize<BridgeConfig>(stream, Options)
-        //                      ?? throw new InvalidDataException($"Configuration file '{path}' is empty or invalid.");
-        //config.Validate();
-        //return config;
     }
 
     public void Validate()

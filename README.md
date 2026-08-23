@@ -142,7 +142,13 @@ Expected output (console):
 12:41:20.866  info: WGL2Bridge[0] Bridge running. Press Ctrl+C to stop.
 ```
 
-Stats are emitted every 30 s only when counters change: `out=<frames sent> in=<frames received> dropped=<frames filtered>`.
+Stats are emitted every 30 s only when counters change:
+
+```
+12:42:20.850  info: WGL2Bridge[0] [00:01:00] out=842 in=910 dropped=14
+```
+
+Format: `[uptime hh:mm:ss] out=<frames sent to tunnel> in=<frames received from tunnel> dropped=<frames filtered>`.
 
 Set `"AutoCreateTapAdapter": true` and the bridge will run the `tapctl` + MTU + enable steps itself
 when the adapter is missing (elevated only).
