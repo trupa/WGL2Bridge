@@ -94,7 +94,7 @@ build. Use **Raw** only for Windows↔Windows.
 
 ## 2. Requirements
 
-- Windows with .NET 9 SDK (or a published self-contained build).
+- Windows (x64). No runtime or SDK required — WGL2Bridge is distributed as a self-contained native binary.
 - **tap-windows6** driver — ships with the OpenVPN installer as "TAP Virtual Ethernet Adapter".
   NetBird's and WireGuard's own adapters are Layer 3 only and **cannot** be used as the source TAP.
 - WireGuard or NetBird tunnel already up.
@@ -129,7 +129,7 @@ Disable-NetAdapterBinding -Name "Industrial-TAP" -ComponentID ms_msclient,ms_ser
 Run it:
 
 ```powershell
-dotnet run -- bridge.config.json
+.\WGL2Bridge.exe bridge.config.json
 ```
 
 Expected output (console):

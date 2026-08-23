@@ -11,6 +11,10 @@ namespace WGL2Bridge;
     AllowTrailingCommas = true,
     NumberHandling = JsonNumberHandling.AllowReadingFromString,
     GenerationMode = JsonSourceGenerationMode.Metadata)]
+[JsonSerializable(typeof(BridgeConfig))]
+internal partial class BridgeConfigJsonContext : JsonSerializerContext
+{
+}
 
 /// <summary>
 /// Bridge configuration, loadable from a JSON document on disk.
@@ -200,3 +204,5 @@ public sealed class BridgeConfig
         EffectiveTapMtu = TapMtuOverride ?? EffectiveTapMtu;
     }
 }
+
+

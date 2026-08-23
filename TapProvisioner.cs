@@ -53,34 +53,28 @@ public static class TapProvisioner
         log($"Creating TAP adapter with {tapCtl} ...");
         await RunAsync(tapCtl, ["create", "--name", config.TapAdapterName], log, cancellationToken).ConfigureAwait(false);
 
-        // The device node takes a moment to register before its registry entries are readable.
+        // Wait for the registry entry so the TAP driver can open the device.
+        bool registryReady = false;
         for (int attempt = 0; attempt < 20; attempt++)
         {
             if (NativeMethods.TryResolveAdapterGuidByName(config.TapAdapterName) is not null)
             {
-                log($"TAP adapter '{config.TapAdapterName}' created.");
-                await ConfigureAdapterAsync(config, log, cancellationToken).ConfigureAwait(false);
-                return;
+                registryReady = true;
+                break;
             }
 
             await Task.Delay(500, cancellationToken).ConfigureAwait(false);
         }
 
-        throw new InvalidOperationException(
-            $"tapctl reported success but adapter '{config.TapAdapterName}' did not appear in the registry.");
-    }
+        if (!registryReady)
+        {
+            throw new InvalidOperationException(
+                $"tapctl reported success but adapter '{config.TapAdapterName}' did not appear in the registry.");
+        }
 
-    private static async Task ConfigureAdapterAsync(BridgeConfig config, Action<string> log, CancellationToken cancellationToken)
-    {
-        await RunAsync("netsh",
-            ["interface", "set", "interface", $"name={config.TapAdapterName}", "admin=enabled"],
-            log, cancellationToken).ConfigureAwait(false);
-
-        await RunAsync("netsh",
-            ["interface", "ipv4", "set", "subinterface", config.TapAdapterName, $"mtu={config.EffectiveTapMtu}", "store=persistent"],
-            log, cancellationToken).ConfigureAwait(false);
-
-        log($"Adapter enabled and MTU set to {config.EffectiveTapMtu}.");
+        // tapctl creates the adapter already enabled; MTU is applied by TapNetworkConfigurator
+        // at the start of every bridge session, so no additional configuration is needed here.
+        log($"TAP adapter '{config.TapAdapterName}' created.");
     }
 
     private static void PrintManualInstructions(BridgeConfig config, string? tapCtl, Action<string> log)
@@ -99,7 +93,6 @@ public static class TapProvisioner
             log($"  & \"{tapCtl}\" create --name \"{config.TapAdapterName}\"");
         }
 
-        log($"  netsh interface ipv4 set subinterface \"{config.TapAdapterName}\" mtu={config.EffectiveTapMtu} store=persistent");
         log($"  Enable-NetAdapter -Name \"{config.TapAdapterName}\"");
         log("");
         log($"Alternatively set \"AutoCreateTapAdapter\": true in the configuration and run this bridge elevated.");
