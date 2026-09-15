@@ -65,36 +65,120 @@ The NativeAOT executable is produced at
 
 ## Configuration
 
-All configuration lives in `appsettings.json` (camelCase). Notable keys:
+All configuration lives in `appsettings.json` (camelCase). Below are detailed descriptions of
+every notable configuration key, the expected type, and how the bridge uses the value.
 
-| Key                      | Default            | Meaning                                            |
-| ------------------------ | ------------------ | -------------------------------------------------- |
-| `tapName`                | `Industrial-TAP`   | TAP adapter friendly name                          |
-| `tunnelInterfaceName`    | `NetBird`          | Tunnel interface friendly name                     |
-| `transportMode`          | `Vxlan`            | `Raw`, `Vxlan`, or `GreTap`                        |
-| `peerAddress`            | `null`             | Peer tunnel IP/hostname (or discover via NetBird)  |
-| `peerName`               | `null`             | NetBird peer FQDN to select during CLI discovery   |
-| `tunnelLocalAddress`     | `null`             | Optional local tunnel IP override                  |
-| `vxlanVni`               | `100`              | VXLAN VNI                                          |
-| `vxlanDestinationPort`   | `4789`             | VXLAN UDP destination port                         |
-| `greTapKey`              | `null`             | Optional GRE key                                   |
-| `rawIpProtocol`          | `99`               | Raw mode IP protocol number                        |
-| `peerSourceValidation`   | `true`             | Drop inbound tunnel packets not from the peer (disable for diagnostics) |
-| `reconnectDelaySeconds`  | `5`                | Rebind delay after a recoverable failure           |
-| `tunnelHealthCheckSeconds` | `30`             | Seconds between tunnel health checks (0 = off)     |
-| `stopOnLoopDetected`     | `true`             | Exit when our own loop probe returns               |
-| `enableLoopDetection`    | `true`             | Inject 0x88B5 loop-detection probes                |
-| `loopProbeIntervalSeconds` | `10`             | Seconds between 0x88B5 loop probes                 |
-| `statsIntervalSeconds`   | `15`              | Seconds between packet-counter log lines (0 = off) |
-| `macAgingSeconds`        | `300`              | Learned-MAC aging                                  |
-| `tapIpAddress`           | `null`             | Static TAP IPv4/CIDR; empty/null falls back to DHCP |
-| `createTapIfMissing`     | `true`             | Create the TAP adapter when it doesn't exist        |
-| `tapInstallToolPath`     | `null`             | Path to tapctl.exe / tapinstall.exe / devcon.exe (auto-searched) |
-| `tapDriverInfPath`       | `null`             | Path to OemVista.inf (auto-searched)                |
-| `tapHardwareId`          | `tap0901`          | Hardware ID used when creating the adapter          |
-| `consoleLogLevel` / `fileLogLevel` | `Information` / `Debug` | Independent log levels              |
-| `dropUdpPorts`           | `[5353,5355,1900,3702,137,138,17500,27036]` | Consumer discovery UDP ports to drop |
-| `allowVlans`             | `null`             | VLAN IDs to bridge; null/empty = all VLANs + untagged |
+- tapName (string, default: "Industrial-TAP")
+  - The friendly name of the TAP-Windows adapter to use. This is the adapter name visible in
+    the Windows network control panel. When `createTapIfMissing` is true the program will attempt
+    to create or rename an adapter to this name.
+
+- tunnelInterfaceName (string, default: "NetBird")
+  - The friendly name of the WireGuard/NetBird tunnel interface on the host. The encapsulation socket
+    binds to an IP on this interface. If `peerAddress` is omitted the program will attempt discovery
+    using the NetBird control plane and `peerName`.
+
+- transportMode (string, default: "Vxlan")
+  - One of `Vxlan`, `GreTap`, or `Raw`. Determines the outer encapsulation used for frames sent over
+    the tunnel. `Vxlan` and `GreTap` are preferred for interoperability with kernel peers; `Raw` sends
+    the Ethernet frame as a raw IP payload and requires the peer to understand the chosen IP protocol
+    number.
+
+- peerAddress (string|null, default: null)
+  - The IP address (or hostname) of the remote peer to which encapsulated frames are sent. This value
+    is used as a fallback when name-based discovery (see `peerName`) is not configured or fails to
+    resolve. If `peerName` is set and discovery succeeds, the discovered peer IP takes precedence over
+    `peerAddress`.
+
+- peerName (string|null, default: null)
+  - NetBird peer FQDN used during CLI discovery. When set the bridge attempts to discover a peer whose
+    NetBird identity (FQDN) matches this value. If a matching (or any connected) peer is discovered,
+    that peer's IP will be used even if `peerAddress` is configured. Set this to target a specific
+    NetBird peer when multiple peers exist.
+
+- tunnelLocalAddress (string|null, default: null)
+  - Optional override for the local tunnel IP address used as the source for encapsulation packets. If null
+    the bridge selects the best address assigned to `tunnelInterfaceName`.
+
+- vxlanVni (integer, default: 100)
+  - VXLAN VNI (24-bit segment identifier) used when `transportMode` is `Vxlan`. Must match the VNI configured
+    on the Linux/OpenWrt kernel peer for proper decapsulation.
+
+- vxlanDestinationPort (integer, default: 4789)
+  - UDP destination port for VXLAN packets. Standard VXLAN uses 4789; change only if your peer expects a different port.
+
+- greTapKey (integer|null, default: null)
+  - Optional GRE key when using `GreTap`. If configured the peer must be configured with the same key to accept and demultiplex traffic.
+
+- rawIpProtocol (integer, default: 99)
+  - IPv4 protocol number used for `Raw` transport. The peer must be configured to receive raw IP packets of this protocol number and inject the payload as Ethernet frames.
+
+- peerSourceValidation (boolean, default: true)
+  - When true the bridge drops inbound tunnel packets that do not appear to originate from the configured `peerAddress` or discovered NetBird peer. Disable only for diagnostics or when multiple peers legitimately send traffic.
+
+- reconnectDelaySeconds (integer, default: 5)
+  - Delay (seconds) before attempting to rebind or reconnect after a recoverable failure such as transient network error.
+
+- tunnelHealthCheckSeconds (integer, default: 30)
+  - Interval in seconds between health-checks that validate the tunnel reachability and the peer's presence. Set to 0 to disable periodic checks.
+
+- stopOnLoopDetected (boolean, default: true)
+  - If true the process will exit when its own loop-detection probe is observed coming back from the tunnel. Useful to prevent bridging two ends of the same segment back-to-back.
+
+- enableLoopDetection (boolean, default: true)
+  - If enabled the bridge periodically injects a special 0x88B5 probe frame to detect loops. Disable for environments where loop-detection probes are undesirable.
+
+- loopProbeIntervalSeconds (integer, default: 10)
+  - Seconds between loop-detection probe injections when `enableLoopDetection` is true.
+
+- statsIntervalSeconds (integer, default: 15)
+  - Interval for logging aggregated packet counters and other runtime statistics. Set to 0 to disable periodic stats logging.
+
+- macAgingSeconds (integer, default: 300)
+  - Time in seconds after which learned MAC table entries expire if not refreshed. Tune based on network churn.
+
+- tapIpAddress (string|null, default: null)
+  - Optional static IPv4/CIDR to assign to the TAP adapter (e.g. "192.168.100.2/24"). When null the TAP falls back to DHCP.
+
+- createTapIfMissing (boolean, default: true)
+  - When true the program will attempt to create and configure a TAP adapter if an adapter named `tapName` is not present. This requires the TAP driver installers/tools referenced below and elevated permissions.
+
+- tapInstallToolPath (string|null, default: null)
+  - Explicit path to installer helper (`tapctl.exe`, `tapinstall.exe`, or `devcon.exe`). When null the bridge searches common locations (OpenVPN bin, PATH) before failing.
+
+- tapDriverInfPath (string|null, default: null)
+  - Explicit path to the TAP driver INF (e.g. `OemVista.inf`). Required only when the automatic search cannot locate the driver package.
+
+- tapHardwareId (string, default: "tap0901")
+  - The hardware ID used when creating the TAP device. Typically `tap0901` for OpenVPN's TAP-Windows6 adapters.
+
+- consoleLogLevel / fileLogLevel (string, default: "Information" / "Debug")
+  - Logging levels for console and file sinks respectively. Accepts standard serilog level names (e.g. `Verbose`, `Debug`, `Information`, `Warning`, `Error`, `Fatal`).
+
+- dropUdpPorts (array of integers, default: `[5353,5355,1900,3702,137,138,17500,27036]`)
+  - UDP destination ports to silently drop when observed on the TAP input. These are common consumer/service discovery and broadcast ports (mDNS, LLMNR, SSDP, WS-Discovery, NetBIOS) which reduce unnecessary chattiness over the bridge.
+
+- allowVlans (array of integers|null, default: null)
+  - When set, only frames tagged with one of the specified VLAN IDs are forwarded; untagged frames are dropped. When null all VLANs are allowed and VLAN tags are preserved across encapsulation.
+
+
+## appsettings.json example
+
+```json
+{
+  "tapName": "Industrial-TAP",
+  "tunnelInterfaceName": "NetBird",
+  "transportMode": "Vxlan",
+  "peerAddress": null,
+  "vxlanVni": 100,
+  "createTapIfMissing": true
+}
+```
+
+## Logging levels reference
+
+`Info` = lifecycle, `Warning` = recoverable, `Error` = fatal/config, `Debug` = diagnostics.
+
 | `assumeVlanTagged`       | `true`             | Assume 802.1Q-tagged frames when deriving the TAP MTU |
 | `maxBroadcastPps`        | `0`                | Broadcast/multicast storm limit per direction (0 = off) |
 | `logFilePath`            | `wgl2bridge.log`   | Plain-text log file path                       |
@@ -152,3 +236,21 @@ sc.exe delete WGL2Bridge
 - File: `yyyy-MM-dd HH:mm:ss.fff [Level] category: message`, rotated at `logMaxBytes`.
 
 `Info` = lifecycle, `Warning` = recoverable, `Error` = fatal/config, `Debug` = diagnostics.
+
+## License
+
+Copyright (c) KaicapTech
+
+WGL2Bridge is provided under the MIT License. You may use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, subject to the following conditions:
+
+- The above copyright notice and this permission notice shall be included in all copies or substantial
+  portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
+OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+If you prefer, add a separate LICENSE file with the exact MIT text and update this README to point to it.
