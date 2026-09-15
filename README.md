@@ -134,11 +134,23 @@ every notable configuration key, the expected type, and how the bridge uses the 
 - statsIntervalSeconds (integer, default: 15)
   - Interval for logging aggregated packet counters and other runtime statistics. Set to 0 to disable periodic stats logging.
 
+- maxBroadcastPps (integer, default: 0)
+  - Per-direction broadcast/multicast forwarding limit (frames per second). When set to a positive value the bridge silently drops excess multicast/broadcast frames above the rate to limit storms and chattiness over the tunnel. A value of 0 disables rate limiting.
+
+- metricsPort (integer, default: 0)
+  - Local-only HTTP port (loopback) for serving simple text metrics and counters. Set to 0 to disable. Example: `metricsPort: 9080` exposes counters at `http://127.0.0.1:9080/` for local scraping or debugging.
+
 - macAgingSeconds (integer, default: 300)
   - Time in seconds after which learned MAC table entries expire if not refreshed. Tune based on network churn.
 
+- assumeVlanTagged (boolean, default: true)
+  - When true the bridge assumes incoming Ethernet frames on the TAP are 802.1Q-tagged and accounts for the 4-byte VLAN tag when deriving the TAP MTU (inner header length = 18 bytes). Set to false for untagged deployments so the derived TAP MTU uses the 14-byte inner Ethernet header. Incorrect setting can cause MTU/fragmentation issues.
+
 - tapIpAddress (string|null, default: null)
   - Optional static IPv4/CIDR to assign to the TAP adapter (e.g. "192.168.100.2/24"). When null the TAP falls back to DHCP.
+
+- renewDhcpOnReconnect (boolean, default: true)
+  - When true the bridge executes an `ipconfig /renew` against the TAP adapter after a successful reconnect sequence when the TAP is configured for DHCP (i.e. `tapIpAddress` is null). This is done after the forwarding pumps are up so the DHCPDISCOVER packets have a forwarding path.
 
 - createTapIfMissing (boolean, default: true)
   - When true the program will attempt to create and configure a TAP adapter if an adapter named `tapName` is not present. This requires the TAP driver installers/tools referenced below and elevated permissions.
@@ -149,11 +161,20 @@ every notable configuration key, the expected type, and how the bridge uses the 
 - tapDriverInfPath (string|null, default: null)
   - Explicit path to the TAP driver INF (e.g. `OemVista.inf`). Required only when the automatic search cannot locate the driver package.
 
+- netbirdCliPath (string|null, default: null)
+  - Optional explicit path to the `netbird.exe` CLI used for discovery and status checks. When null the bridge searches PATH and common install directories. If the CLI cannot be found NetBird-based discovery is unavailable and the resolver falls back to the configured `peerAddress` (if provided).
+
 - tapHardwareId (string, default: "tap0901")
   - The hardware ID used when creating the TAP device. Typically `tap0901` for OpenVPN's TAP-Windows6 adapters.
 
 - consoleLogLevel / fileLogLevel (string, default: "Information" / "Debug")
   - Logging levels for console and file sinks respectively. Accepts standard serilog level names (e.g. `Verbose`, `Debug`, `Information`, `Warning`, `Error`, `Fatal`).
+
+- logFilePath (string, default: "wgl2bridge.log")
+  - Path to the plain-text application log file. If a relative path is provided it is resolved against the process working directory (services typically write under ProgramData or the service's working directory). Ensure the process has write permissions for the containing directory when running as a service.
+
+- logMaxBytes (integer, default: 10485760)
+  - Maximum size in bytes for the log file before rotation. When the file reaches this size it is rotated to `wgl2bridge.log.1` and a fresh file is started. Set to a larger value for long-term retention or smaller for low-disk-space environments.
 
 - dropUdpPorts (array of integers, default: `[5353,5355,1900,3702,137,138,17500,27036]`)
   - UDP destination ports to silently drop when observed on the TAP input. These are common consumer/service discovery and broadcast ports (mDNS, LLMNR, SSDP, WS-Discovery, NetBIOS) which reduce unnecessary chattiness over the bridge.
@@ -178,14 +199,6 @@ every notable configuration key, the expected type, and how the bridge uses the 
 ## Logging levels reference
 
 `Info` = lifecycle, `Warning` = recoverable, `Error` = fatal/config, `Debug` = diagnostics.
-
-| `assumeVlanTagged`       | `true`             | Assume 802.1Q-tagged frames when deriving the TAP MTU |
-| `maxBroadcastPps`        | `0`                | Broadcast/multicast storm limit per direction (0 = off) |
-| `logFilePath`            | `wgl2bridge.log`   | Plain-text log file path                       |
-| `logMaxBytes`            | `10485760`         | Log size before rotating to `.1`              |
-| `renewDhcpOnReconnect`   | `true`             | `ipconfig /renew` on the TAP after a reconnect |
-| `metricsPort`            | `0`                | Loopback HTTP metrics port (0 = disabled)      |
-| `netbirdCliPath`         | `null`             | Explicit path to netbird.exe (else auto-searched) |
 
 Run with a custom config path: `WGL2Bridge.exe path\to\config.json`.
 
