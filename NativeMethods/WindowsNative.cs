@@ -2,13 +2,13 @@
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
-namespace WGL2Bridge.Win32;
+namespace WGL2Bridge.NativeMethods;
 
 /// <summary>
 /// Source-generated P/Invoke declarations. TAP-Windows6 uses METHOD_BUFFERED control codes rooted at
 /// FILE_DEVICE_UNKNOWN (0x22), matching OpenVPN's tap-windows.h (TAP_WIN_CONTROL_CODE macro).
 /// </summary>
-internal static partial class NativeMethods
+internal static partial class WindowsNative
 {
     private const uint FileDeviceUnknown = 0x22;
     private const uint MethodBuffered = 0;

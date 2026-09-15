@@ -4,7 +4,7 @@ using System.Runtime.Versioning;
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
 using WGL2Bridge.Network;
-using WGL2Bridge.Win32;
+using WGL2Bridge.NativeMethods;
 
 namespace WGL2Bridge.Tap;
 
@@ -35,13 +35,13 @@ public sealed class TapAdapter : IDisposable
     /// <summary>Opens the device, queries its MAC, and forces the media status to connected.</summary>
     public void Open()
     {
-        nint raw = NativeMethods.CreateFile(
+        nint raw = WindowsNative.CreateFile(
             DevicePath,
-            NativeMethods.GenericRead | NativeMethods.GenericWrite,
-            NativeMethods.FileShareRead | NativeMethods.FileShareWrite,
+            WindowsNative.GenericRead | WindowsNative.GenericWrite,
+            WindowsNative.FileShareRead | WindowsNative.FileShareWrite,
             lpSecurityAttributes: 0,
-            NativeMethods.OpenExisting,
-            NativeMethods.FileAttributeSystem | NativeMethods.FileFlagOverlapped,
+            WindowsNative.OpenExisting,
+            WindowsNative.FileAttributeSystem | WindowsNative.FileFlagOverlapped,
             hTemplateFile: 0);
 
         if (raw is -1 or 0)
@@ -93,8 +93,8 @@ public sealed class TapAdapter : IDisposable
             state);
 
         bool ok = read
-            ? NativeMethods.ReadFile(_handle!, pin + offset, (uint)count, null, overlapped)
-            : NativeMethods.WriteFile(_handle!, pin + offset, (uint)count, null, overlapped);
+            ? WindowsNative.ReadFile(_handle!, pin + offset, (uint)count, null, overlapped)
+            : WindowsNative.WriteFile(_handle!, pin + offset, (uint)count, null, overlapped);
 
         if (!ok)
         {
@@ -124,7 +124,7 @@ public sealed class TapAdapter : IDisposable
     private void QueryMac()
     {
         var buffer = new byte[Ethernet.MacLength];
-        if (!Ioctl(NativeMethods.TapIoctlGetMac, input: null, buffer))
+        if (!Ioctl(WindowsNative.TapIoctlGetMac, input: null, buffer))
         {
             throw new IOException($"TAP GET_MAC failed for '{DevicePath}' (error {Marshal.GetLastPInvokeError()}).");
         }
@@ -135,14 +135,14 @@ public sealed class TapAdapter : IDisposable
     private void SetMediaStatus(bool connected)
     {
         byte[] input = BitConverter.GetBytes(connected ? 1u : 0u);
-        if (!Ioctl(NativeMethods.TapIoctlSetMediaStatus, input, output: null))
+        if (!Ioctl(WindowsNative.TapIoctlSetMediaStatus, input, output: null))
         {
             throw new IOException($"TAP SET_MEDIA_STATUS failed for '{DevicePath}' (error {Marshal.GetLastPInvokeError()}).");
         }
     }
 
     private bool Ioctl(uint code, byte[]? input, byte[]? output) =>
-        NativeMethods.DeviceIoControl(
+        WindowsNative.DeviceIoControl(
             _handle!,
             code,
             input,
@@ -181,7 +181,7 @@ public sealed class TapAdapter : IDisposable
         {
             if (!Handle.IsClosed && !Handle.IsInvalid)
             {
-                NativeMethods.CancelIoEx(Handle, null);
+                WindowsNative.CancelIoEx(Handle, null);
             }
         }
 
