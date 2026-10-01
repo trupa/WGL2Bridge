@@ -250,6 +250,46 @@ sc.exe delete WGL2Bridge
 
 `Info` = lifecycle, `Warning` = recoverable, `Error` = fatal/config, `Debug` = diagnostics.
 
+## Example Peer configuration
+
+- Setup a Peer running Ubuntu Linux on a Raspberry Pi 5 with ubuntu.
+
+- The peer must have a bridge configured and the adapter to the lan in it. Example netplan file ("/etc/netplan/50-cloud-init.yaml"):
+	```
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: false
+  bridges:
+    br0:
+      interfaces:
+        - eth0
+      dhcp4: true
+      addresses:
+        - 192.168.1.2/24
+	```
+- Setup a network dispatcher script ("/etc/networkd-dispatcher/routable.d/99-vxlan-bridge"): 
+```
+  #!/bin/bash
+  if [ "$IFACE" = "wt0" ]; then
+    ip link delete vxlan0 2>/dev/null
+
+    ip link add vxlan0 type vxlan id 4096 dstport 4789 dev wt0 learning
+    ip link set vxlan0 mtu 1230
+
+    ip link set vxlan0 master br0
+    ip link set vxlan0 up
+  fi
+ ```
+Make sure to make the script executable:
+ ```
+ chmod +x /etc/networkd-dispatcher/routable.d/99-vxlan-bridge
+```
+When "wt0" comes "up" the script will create a vxlan inteface bind it to wt0 and add vxlan to the bridge.
+
+On your windows machine, run WGL2Bridge bound to the peer running this conguration. All L2 frames along with L3 packets should make it to your Raspberry Pi peer Lan.
+
 ## License
 
 Copyright (c) KaicapTech
