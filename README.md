@@ -5,7 +5,7 @@ TAP-Windows6 adapter, filters consumer broadcast noise, encapsulates the survivi
 (Raw / VXLAN / GRETAP), and sends them over a WireGuard/NetBird tunnel to a peer that injects them
 onto a remote segment — so two segments behave like one switch across an encrypted WAN.
 
-Primary use: engineering access (TIA Portal, DCP discovery, watch tables), not hard real-time control.
+Primary use: engineering access (DCP discovery, device configuration), not hard real-time control.
 
 ## How it works
 
