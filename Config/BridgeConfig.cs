@@ -1,4 +1,5 @@
 using WGL2Bridge.Logging;
+using WGL2Bridge.Network;
 using WGL2Bridge.Platform;
 
 namespace WGL2Bridge.Config;
@@ -11,9 +12,6 @@ public enum TransportMode
 
     /// <summary>VXLAN (UDP/4789) encapsulation; compatible with Linux kernel vxlan interfaces.</summary>
     Vxlan,
-
-    /// <summary>GRETAP (GRE with protocol 0x6558) encapsulation; compatible with Linux gretap interfaces.</summary>
-    GreTap,
 }
 
 /// <summary>
@@ -24,7 +22,7 @@ public enum TransportMode
 public sealed record BridgeConfig
 {
     /// <summary>Friendly name of the TAP-Windows6 adapter to bridge.</summary>
-    public string TapName { get; init; } = "Industrial-TAP";
+    public string TapName { get; init; } = "WGBridge-TAP";
 
     /// <summary>Friendly name of the WireGuard/NetBird tunnel interface.</summary>
     public string TunnelInterfaceName { get; init; } = "NetBird";
@@ -46,9 +44,6 @@ public sealed record BridgeConfig
 
     /// <summary>VXLAN UDP destination port (IANA default 4789).</summary>
     public int VxlanDestinationPort { get; init; } = 4789;
-
-    /// <summary>Optional GRE key (K bit) for GRETAP; null emits a plain 4-byte GRE header.</summary>
-    public uint? GreTapKey { get; init; }
 
     /// <summary>IP protocol number used by Raw mode (1..255).</summary>
     public int RawIpProtocol { get; init; } = 99;
@@ -120,6 +115,12 @@ public sealed record BridgeConfig
     /// <summary>Maximum log file size in bytes before it is rotated to '.1'.</summary>
     public long LogMaxBytes { get; init; } = 10 * 1024 * 1024;
 
+    /// <summary>
+    /// L2 EtherTypes to drop, as hexadecimal text with an optional '0x' prefix (e.g. "0x88CC" for
+    /// LLDP). Empty means no EtherType is blocked. Applied in both directions.
+    /// </summary>
+    public string[] DropEtherTypes { get; init; } = [];
+
     /// <summary>Consumer discovery UDP destination ports to drop (mDNS, LLMNR, SSDP, WS-Discovery, NetBIOS, ...).</summary>
     public int[] DropUdpPorts { get; init; } = [5353, 5355, 1900, 3702, 137, 138, 17500, 27036];
 
@@ -160,6 +161,14 @@ public sealed record BridgeConfig
             errors.Add("'MaxBroadcastPps' must be >= 0.");
         if (MetricsPort is < 0 or > 65535)
             errors.Add("'MetricsPort' must be between 0 and 65535.");
+        foreach (string etherType in DropEtherTypes)
+        {
+            if (!Ethernet.TryParseEtherType(etherType, out _))
+            {
+                errors.Add($"'DropEtherTypes' contains invalid EtherType '{etherType}' (expected hex such as '0x88CC').");
+                break;
+            }
+        }
         foreach (int port in DropUdpPorts)
         {
             if (port is < 0 or > 65535)

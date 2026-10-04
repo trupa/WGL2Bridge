@@ -2,25 +2,26 @@
 
 A single self-contained, Layer 2 Ethernet bridge that reads raw frames from a
 TAP-Windows6 adapter, filters consumer broadcast noise, encapsulates the surviving frames
-(Raw / VXLAN / GRETAP), and sends them over a WireGuard/NetBird tunnel to a peer that injects them
+(Raw / VXLAN), and sends them over a WireGuard/NetBird tunnel to a peer that injects them
 onto a remote segment — so two segments behave like one switch across an encrypted WAN.
 
-Primary use: engineering access (DCP discovery, device configuration), not hard real-time control.
+Primary use: remote Layer 2 access for configuration and diagnostics, not hard real-time control.
 
 ## How it works
 
 ```
-                  raw Ethernet               VXLAN / GRETAP                  WireGuard                raw Ethernet
+                  raw Ethernet               VXLAN UDP 4789                  WireGuard                raw Ethernet
 +-------------------+  frames   +----------------+   (Raw IP) +-----------------+ (NetBird) +----------------+  frames  +------------------------+
-|  Engineering tool | --------> |  TAP adapter   | ---------> |      Bridge     | --------> |  Remote peer   | -------> | Local industrial LAN   |
-|  (TIA Portal, DCP,| <-------  | (TAP-Windows6) | <--------- | (filter + encap)| <-------- | (Linux/OpenWrt)| <------- | (PLCs, drives, I/O, ...)|
-|   watch tables)   |           +----------------+            +-----------------+           +----------------+          +------------------------+
+|  Host application | --------> |  TAP adapter   | ---------> |      Bridge     | --------> |  Remote peer   | -------> | Remote LAN (bridged)   |
+|  (management tool,| <-------  | (TAP-Windows6) | <--------- | (filter + encap)| <-------- | (Linux/OpenWrt)| <------- | (servers, hosts, and...)|
+|   console view)   |           +----------------+            +-----------------+           +----------------+          +------------------------+
 +-------------------+
 ```
 
-Two symmetric pumps run concurrently:
+Two symmetric forwarding pumps run concurrently, alongside the probe, statistics, interface-watch
+and health-check pumps:
 
-- **TAP → tunnel**: overlapped `ReadFile` → `IndustrialFilter` / `MacTable` / `LoopDetector` →
+- **TAP → tunnel**: overlapped `ReadFile` → `FrameFilter` / `MacTable` / `LoopDetector` →
   constant encapsulation header (already written into buffer headroom) → `sendto` on a socket bound
   to the tunnel IP.
 - **Tunnel → TAP**: `recvfrom` → header validation + the same filters → `WriteFile` to the TAP device.
@@ -30,11 +31,10 @@ Two symmetric pumps run concurrently:
 | Mode     | Headroom | Outer overhead | Linux peer                         |
 | -------- | -------- | -------------- | ---------------------------------- |
 | `Vxlan`  | 8 bytes  | 36 (IP+UDP+VXLAN) | kernel `vxlan` (dstport 4789)   |
-| `GreTap` | 4/8 bytes | 24/28 (IP+GRE) | kernel `gretap`                 |
 | `Raw`    | 0        | 20 (IP)        | requires matching software (lab) |
 
-`Vxlan` and `GreTap` are the production modes — the Linux/OpenWrt peer is kernel-native and needs no
-software. `Raw` carries the bare frame as a raw IP payload with a configurable protocol number.
+`Vxlan` is the production mode — the Linux/OpenWrt peer is kernel-native and needs no software.
+`Raw` carries the bare frame as a raw IP payload with a configurable protocol number.
 
 Egress is pinned: the encapsulation socket binds to the tunnel interface IP, so frames cannot leak
 onto the physical LAN.
@@ -51,8 +51,10 @@ onto the physical LAN.
   (`tapinstall.exe` / `devcon.exe`) must be present — set `tapDriverInfPath` and
   `tapInstallToolPath` if they aren't in the standard locations.
 - **NetBird** (or a plain WireGuard interface) with an active tunnel; name it to match
-  `tunnelInterfaceName`, or set `peerAddress` explicitly. On Windows the WireGuard/NetBird adapter
-  is usually named `wt0` (or `NetBird`); check with `netsh interface show interface`.
+  `tunnelInterfaceName`, or set `peerAddress` explicitly. On Windows the adapter is usually named
+  `wt0` for NetBird or the tunnel name for a plain WireGuard config; check with
+  `netsh interface show interface`. A plain WireGuard tunnel needs only `peerAddress` (leave
+  `peerName` null) and does not require the NetBird CLI.
 
 ## Build / publish
 
@@ -68,7 +70,7 @@ The NativeAOT executable is produced at
 All configuration lives in `appsettings.json` (camelCase). Below are detailed descriptions of
 every notable configuration key, the expected type, and how the bridge uses the value.
 
-- tapName (string, default: "Industrial-TAP")
+- tapName (string, default: "WGBridge-TAP")
   - The friendly name of the TAP-Windows adapter to use. This is the adapter name visible in
     the Windows network control panel. When `createTapIfMissing` is true the program will attempt
     to create or rename an adapter to this name.
@@ -79,10 +81,9 @@ every notable configuration key, the expected type, and how the bridge uses the 
     using the NetBird control plane and `peerName`.
 
 - transportMode (string, default: "Vxlan")
-  - One of `Vxlan`, `GreTap`, or `Raw`. Determines the outer encapsulation used for frames sent over
-    the tunnel. `Vxlan` and `GreTap` are preferred for interoperability with kernel peers; `Raw` sends
-    the Ethernet frame as a raw IP payload and requires the peer to understand the chosen IP protocol
-    number.
+  - One of `Vxlan` or `Raw`. Determines the outer encapsulation used for frames sent over the
+    tunnel. `Vxlan` is preferred for interoperability with kernel peers; `Raw` sends the Ethernet
+    frame as a raw IP payload and requires the peer to understand the chosen IP protocol number.
 
 - peerAddress (string|null, default: null)
   - The IP address (or hostname) of the remote peer to which encapsulated frames are sent. This value
@@ -94,7 +95,14 @@ every notable configuration key, the expected type, and how the bridge uses the 
   - NetBird peer FQDN used during CLI discovery. When set the bridge attempts to discover a peer whose
     NetBird identity (FQDN) matches this value. If a matching (or any connected) peer is discovered,
     that peer's IP will be used even if `peerAddress` is configured. Set this to target a specific
-    NetBird peer when multiple peers exist.
+    NetBird peer when multiple peers exist. Leave null when the peer is pinned via `peerAddress`.
+
+Note on peer discovery: the NetBird CLI is only consulted when discovery is actually required — when
+`peerName` is set, or when `peerAddress` is empty. If `peerAddress` is set and `peerName` is null the
+peer is pinned and NetBird is never used: no `netbird status` subprocess is spawned and no NetBird
+warnings are logged. A plain WireGuard tunnel is therefore fully supported — set
+`tunnelInterfaceName` to the WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and
+leave `peerName` null.
 
 - tunnelLocalAddress (string|null, default: null)
   - Optional override for the local tunnel IP address used as the source for encapsulation packets. If null
@@ -107,9 +115,6 @@ every notable configuration key, the expected type, and how the bridge uses the 
 - vxlanDestinationPort (integer, default: 4789)
   - UDP destination port for VXLAN packets. Standard VXLAN uses 4789; change only if your peer expects a different port.
 
-- greTapKey (integer|null, default: null)
-  - Optional GRE key when using `GreTap`. If configured the peer must be configured with the same key to accept and demultiplex traffic.
-
 - rawIpProtocol (integer, default: 99)
   - IPv4 protocol number used for `Raw` transport. The peer must be configured to receive raw IP packets of this protocol number and inject the payload as Ethernet frames.
 
@@ -120,13 +125,10 @@ every notable configuration key, the expected type, and how the bridge uses the 
   - Delay (seconds) before attempting to rebind or reconnect after a recoverable failure such as transient network error.
 
 - tunnelHealthCheckSeconds (integer, default: 30)
-  - Interval in seconds between health-checks that validate the tunnel reachability and the peer's presence. Set to 0 to disable periodic checks.
+  - Interval in seconds for the tunnel-interface reachability check (the tunnel adapter must still exist and report Up). The peer-presence and no-inbound-traffic checks run on an independent fixed 30-second cadence. Set to 0 to disable all periodic health checks.
 
 - stopOnLoopDetected (boolean, default: true)
-  - If true the process will exit when its own loop-detection probe is observed coming back from the tunnel. Useful to prevent bridging two ends of the same segment back-to-back.
-
-- enableLoopDetection (boolean, default: true)
-  - If enabled the bridge periodically injects a special 0x88B5 probe frame to detect loops. Disable for environments where loop-detection probes are undesirable.
+  - If true the process will exit when its own loop-detection probe is observed returning on either path (TAP or tunnel). Useful to prevent bridging two ends of the same segment back-to-back.
 
 - loopProbeIntervalSeconds (integer, default: 10)
   - Seconds between loop-detection probe injections when `enableLoopDetection` is true.
@@ -142,6 +144,9 @@ every notable configuration key, the expected type, and how the bridge uses the 
 
 - macAgingSeconds (integer, default: 300)
   - Time in seconds after which learned MAC table entries expire if not refreshed. Tune based on network churn.
+
+- enableLoopDetection (boolean, default: true)
+  - If enabled the bridge periodically injects a special 0x88B5 probe frame to detect loops. Disable for environments where loop-detection probes are undesirable.
 
 - assumeVlanTagged (boolean, default: true)
   - When true the bridge assumes incoming Ethernet frames on the TAP are 802.1Q-tagged and accounts for the 4-byte VLAN tag when deriving the TAP MTU (inner header length = 18 bytes). Set to false for untagged deployments so the derived TAP MTU uses the 14-byte inner Ethernet header. Incorrect setting can cause MTU/fragmentation issues.
@@ -161,14 +166,11 @@ every notable configuration key, the expected type, and how the bridge uses the 
 - tapDriverInfPath (string|null, default: null)
   - Explicit path to the TAP driver INF (e.g. `OemVista.inf`). Required only when the automatic search cannot locate the driver package.
 
-- netbirdCliPath (string|null, default: null)
-  - Optional explicit path to the `netbird.exe` CLI used for discovery and status checks. When null the bridge searches PATH and common install directories. If the CLI cannot be found NetBird-based discovery is unavailable and the resolver falls back to the configured `peerAddress` (if provided).
-
 - tapHardwareId (string, default: "tap0901")
   - The hardware ID used when creating the TAP device. Typically `tap0901` for OpenVPN's TAP-Windows6 adapters.
 
 - consoleLogLevel / fileLogLevel (string, default: "Information" / "Debug")
-  - Logging levels for console and file sinks respectively. Accepts standard serilog level names (e.g. `Verbose`, `Debug`, `Information`, `Warning`, `Error`, `Fatal`).
+  - Logging levels for console and file sinks respectively. Accepts the enum names `Trace`, `Debug`, `Information`, `Warning`, `Error`, `Critical`.
 
 - logFilePath (string, default: "wgl2bridge.log")
   - Path to the plain-text application log file. If a relative path is provided it is resolved against the process working directory (services typically write under ProgramData or the service's working directory). Ensure the process has write permissions for the containing directory when running as a service.
@@ -176,18 +178,24 @@ every notable configuration key, the expected type, and how the bridge uses the 
 - logMaxBytes (integer, default: 10485760)
   - Maximum size in bytes for the log file before rotation. When the file reaches this size it is rotated to `wgl2bridge.log.1` and a fresh file is started. Set to a larger value for long-term retention or smaller for low-disk-space environments.
 
+- dropEtherTypes (array of strings, default: `[]`)
+  - L2 EtherTypes to silently drop, given as hexadecimal text with an optional `0x` prefix (for example `"0x88CC"` blocks LLDP). Matched on the frame's inner EtherType (after any VLAN tags) and applied in both directions. Empty blocks nothing.
+
 - dropUdpPorts (array of integers, default: `[5353,5355,1900,3702,137,138,17500,27036]`)
-  - UDP destination ports to silently drop when observed on the TAP input. These are common consumer/service discovery and broadcast ports (mDNS, LLMNR, SSDP, WS-Discovery, NetBIOS) which reduce unnecessary chattiness over the bridge.
+  - UDP destination ports to silently drop, matched in both directions (TAP→tunnel and tunnel→TAP). These are common consumer/service discovery and broadcast ports (mDNS, LLMNR, SSDP, WS-Discovery, NetBIOS) which reduce unnecessary chattiness over the bridge.
 
 - allowVlans (array of integers|null, default: null)
-  - When set, only frames tagged with one of the specified VLAN IDs are forwarded; untagged frames are dropped. When null all VLANs are allowed and VLAN tags are preserved across encapsulation.
+  - When set to one or more VLAN IDs, only frames tagged with one of those IDs are forwarded; untagged frames and frames with any other tag are dropped. When null (or an empty array) all VLANs are allowed and VLAN tags are preserved across encapsulation.
+
+- netbirdCliPath (string|null, default: null)
+  - Optional explicit path to the `netbird.exe` CLI used for discovery and status checks. When null the bridge searches PATH and common install directories. If the CLI cannot be found NetBird-based discovery is unavailable and the resolver falls back to the configured `peerAddress` (if provided). The CLI is only consulted when discovery is required (see the note under `peerName`).
 
 
 ## appsettings.json example
 
 ```json
 {
-  "tapName": "Industrial-TAP",
+  "tapName": "WGBridge-TAP",
   "tunnelInterfaceName": "NetBird",
   "transportMode": "Vxlan",
   "peerAddress": null,
@@ -198,23 +206,33 @@ every notable configuration key, the expected type, and how the bridge uses the 
 
 ## Logging levels reference
 
-`Info` = lifecycle, `Warning` = recoverable, `Error` = fatal/config, `Debug` = diagnostics.
+`Information` = lifecycle, `Warning` = recoverable, `Error` = fatal/config, `Debug` = diagnostics
+(`Trace` and `Critical` provide finer control at either end).
 
 Run with a custom config path: `WGL2Bridge.exe path\to\config.json`.
 
-## Filter policy ("Broad-Industrial-Pass")
+## Filter policy
 
-- **Allow**: ARP, PROFINET (`0x8892`), EtherCAT (`0x88A4`), GOOSE (`0x88B8`), SV (`0x88BA`),
-  LLDP (`0x88CC`), all TCP, and all UDP except the configured drop ports.
-- **Drop**: consumer discovery UDP — mDNS 5353, LLMNR 5355, SSDP 1900, WS-Discovery 3702,
-  NetBIOS 137/138, Dropbox 17500, Steam 27036.
-- **Fail open (forward)**: truncated headers, ICMP, and later IP fragments.
+Frames are forwarded by default (fail-open); restriction is opt-in. Every list below is applied in
+both directions (TAP→tunnel and tunnel→TAP).
+
+- **`dropEtherTypes`** — L2 EtherTypes to block, as hexadecimal text (e.g. `"0x88CC"` blocks LLDP),
+  matched on the frame's inner EtherType after any VLAN tags. Empty by default; do not list the
+  loop-probe EtherType `0x88B5`, as blocking it disables loop detection.
+- **`dropUdpPorts`** — IPv4/IPv6 UDP **destination** ports to block. Defaults to common consumer
+  discovery and host-chatter ports (mDNS 5353, LLMNR 5355, SSDP 1900, WS-Discovery 3702,
+  NetBIOS 137/138, Dropbox 17500, Steam 27036).
+- **`allowVlans`** — when set, a frame must carry an 802.1Q/QinQ tag whose VLAN ID is in the list;
+  untagged frames are dropped. When null or empty, all VLANs pass.
+- **Everything else forwards** — all TCP, ICMP, later IP fragments, and any EtherType not in
+  `dropEtherTypes` (including unrecognized types). Truncated headers fail open.
 
 ## Loop detection
 
 A broadcast probe with EtherType `0x88B5`, a `WGL2` magic and a per-instance random ID is injected
-into the TAP segment every `loopProbeIntervalSeconds`. If only our own probe returns, the bridge logs
-the loop and (when `stopOnLoopDetected` is true) stops — preventing a broadcast storm.
+into the TAP segment every `loopProbeIntervalSeconds`. If our own probe is observed returning, on the
+TAP or the tunnel path, the bridge logs the loop and (when `stopOnLoopDetected` is true) stops —
+preventing a broadcast storm.
 
 ## Windows networking quirks handled
 
@@ -248,7 +266,7 @@ sc.exe delete WGL2Bridge
 - Console: `HH:mm:ss.fff message` (single line, no color).
 - File: `yyyy-MM-dd HH:mm:ss.fff [Level] category: message`, rotated at `logMaxBytes`.
 
-`Info` = lifecycle, `Warning` = recoverable, `Error` = fatal/config, `Debug` = diagnostics.
+`Information` = lifecycle, `Warning` = recoverable, `Error` = fatal/config, `Debug` = diagnostics.
 
 ## Example Peer configuration
 
@@ -290,9 +308,64 @@ When "wt0" comes "up" the script will create a vxlan inteface bind it to wt0 and
 
 On your windows machine, run WGL2Bridge bound to the peer running this conguration. All L2 frames along with L3 packets should make it to your Raspberry Pi peer Lan.
 
+### Windows to Windows (one end bridged to its LAN)
+
+Both machines run WGL2Bridge and each selects the other as its peer. Only the machine on the network
+you want to reach bridges its TAP adapter to its physical NIC — the other end simply needs an address
+on that network. This is the Windows-only shape of the Linux peer above.
+
+**Machine B — on the target network (bridged).** `appsettings.json`:
+
+```json
+{
+  "tapName": "WGBridge-TAP",
+  "tunnelInterfaceName": "wt0",
+  "transportMode": "Vxlan",
+  "vxlanVni": 4096,
+  "peerAddress": "100.64.0.1"
+}
+```
+
+Now bridge the adapter so the whole LAN, not just this host, is exposed:
+
+1. Open **Network Connections** (`ncpa.cpl`).
+2. Select the **WGBridge-TAP** adapter and the **physical NIC** on the target network.
+3. Right-click → **Bridge Connections**.
+
+**Machine A — the client (not bridged).** `appsettings.json`:
+
+```json
+{
+  "tapName": "WGBridge-TAP",
+  "tunnelInterfaceName": "wt0",
+  "transportMode": "Vxlan",
+  "vxlanVni": 4096,
+  "peerAddress": "100.64.0.2"
+}
+```
+
+Leave this adapter unbridged. It receives an address on the target network through the tunnel (DHCP,
+or set `tapIpAddress` for a static one), so applications on Machine A reach the devices on that
+network directly.
+
+Notes:
+
+- `vxlanVni` must match on both ends, and each `peerAddress` must point at the **other** machine's
+  tunnel IP (or use `peerName` with NetBird discovery). Here A is `100.64.0.1` and B is `100.64.0.2`.
+- No firewall rule is required when the underlay is NetBird/WireGuard: the encapsulated packets ride
+  inside WireGuard's UDP.
+- Run both ends elevated (the manifest prompts for it).
+- The target network's frames must fit the tunnel. `WGL2Bridge.exe --check` prints the TAP MTU it
+  derives — verify a full-size frame still gets through, since a Windows bridge may not carry the
+  reduced MTU over to the physical NIC.
+- Leave loop detection enabled on the bridged end: if the target network reaches back through the
+  tunnel, the probe returns and the bridge stops rather than storming.
+- `Raw` works the same way (`"transportMode": "Raw"`, with a matching `rawIpProtocol` on both ends)
+  when both ends run this software.
+
 ## License
 
-Copyright (c) KaicapTech
+Copyright (c) 2025 KaicapTech
 
 WGL2Bridge is provided under the MIT License. You may use, copy, modify, merge, publish,
 distribute, sublicense, and/or sell copies of the Software, subject to the following conditions:

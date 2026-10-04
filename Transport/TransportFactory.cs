@@ -10,7 +10,6 @@ public static class TransportFactory
     {
         TransportMode.Raw => new RawTransport(config),
         TransportMode.Vxlan => new VxlanTransport(config),
-        TransportMode.GreTap => new GreTapTransport(config),
         _ => throw new ArgumentOutOfRangeException(nameof(config), "Unknown transport mode."),
     };
 }

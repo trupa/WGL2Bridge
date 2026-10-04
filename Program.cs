@@ -10,6 +10,7 @@ using WGL2Bridge.Network;
 using WGL2Bridge.Peer;
 using WGL2Bridge.Service;
 using WGL2Bridge.Tap;
+using WGL2Bridge.Transport;
 
 namespace WGL2Bridge;
 
@@ -122,15 +123,15 @@ public static class Program
                 BridgeLog.Debug($"TAP '{tapInfo.Name}' -> '{tapInfo.DevicePath}'.");
             }
 
-            int overhead = config.TransportMode switch
-            {
-                TransportMode.Vxlan => 36,
-                TransportMode.GreTap => 24,
-                _ => 20,
-            };
-            int tapMtu = Math.Clamp(tunnel.Mtu - overhead - (config.AssumeVlanTagged ? 18 : 14), 576, 9000);
+            // Use the real transport so the reported MTU matches the runtime session exactly.
+            // Constructing a transport opens no sockets, so this stays a dry run.
+            using IBridgeTransport transport = TransportFactory.Create(config);
+            int tapMtu = Math.Clamp(
+                tunnel.Mtu - transport.EncapsulationOverhead - (config.AssumeVlanTagged ? 18 : 14),
+                576,
+                9000);
 
-            BridgeLog.Info($"Check OK: peer={peer.Address}, tunnel='{config.TunnelInterfaceName}' {tunnel.LocalAddress} MTU {tunnel.Mtu}, tap='{config.TapName}' MTU {tapMtu}.");
+            BridgeLog.Info($"Check OK: peer={peer.Address}, tunnel='{config.TunnelInterfaceName}' {tunnel.LocalAddress} MTU {tunnel.Mtu}, tap='{config.TapName}' MTU {tapMtu}, encap='{transport.Description}'.");
             return true;
         }
         catch (Exception ex)
@@ -148,13 +149,28 @@ public static class Program
             $"tunnel='{config.TunnelInterfaceName}', peer={(config.PeerAddress ?? "(discover)")}.");
 
         var netbird = new NetbirdStatus(config.NetbirdCliPath, config.PeerName);
-        if (!netbird.CliAvailable)
+
+        // The NetBird CLI is only consulted when discovery is actually required: a 'PeerName'
+        // target, or no 'PeerAddress' to pin. With a pinned peer the CLI is never used, so don't
+        // probe it (avoids nuisance warnings and a needless 'netbird status' subprocess).
+        bool overlayDiscoveryRequired =
+            !string.IsNullOrWhiteSpace(config.PeerName) ||
+            string.IsNullOrWhiteSpace(config.PeerAddress);
+
+        if (overlayDiscoveryRequired)
         {
-            BridgeLog.Warning("netbird.exe not found; peer discovery and status checks unavailable.");
+            if (!netbird.CliAvailable)
+            {
+                BridgeLog.Warning("netbird.exe not found; NetBird peer discovery is unavailable.");
+            }
+            else if (!netbird.IsConnected())
+            {
+                BridgeLog.Warning("NetBird daemon is not reporting a connected state.");
+            }
         }
-        else if (!netbird.IsConnected())
+        else
         {
-            BridgeLog.Warning("NetBird daemon is not reporting a connected state.");
+            BridgeLog.Debug("Peer pinned via 'peerAddress'; NetBird CLI not required.");
         }
 
         IPeerProvider peerProvider = new PeerResolver(config, new NetbirdPeerProvider(netbird));

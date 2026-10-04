@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Globalization;
 
 namespace WGL2Bridge.Network;
 
@@ -20,12 +21,6 @@ public static class Ethernet
     public const ushort QinQ = 0x88A8;
     public const ushort Ipv4 = 0x0800;
     public const ushort Ipv6 = 0x86DD;
-    public const ushort Arp = 0x0806;
-    public const ushort Profinet = 0x8892;
-    public const ushort EtherCat = 0x88A4;
-    public const ushort Goose = 0x88B8;
-    public const ushort Sv = 0x88BA;
-    public const ushort Lldp = 0x88CC;
 
     /// <summary>EtherType used by our loop-detection probes.</summary>
     public const ushort LoopProbe = 0x88B5;
@@ -44,6 +39,28 @@ public static class Ethernet
 
     /// <summary>True if the first byte's I/G bit is set (multicast or broadcast).</summary>
     public static bool IsMulticast(ReadOnlySpan<byte> frame) => (frame[0] & 0x01) != 0;
+
+    /// <summary>
+    /// Parses an EtherType from hexadecimal text with an optional <c>0x</c> prefix (e.g. "0x88CC" or
+    /// "88CC"). Returns false for malformed input or values above 0xFFFF.
+    /// </summary>
+    public static bool TryParseEtherType(string? text, out ushort value)
+    {
+        value = 0;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        string trimmed = text.Trim();
+        if (trimmed.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            trimmed = trimmed[2..];
+        }
+
+        return trimmed.Length is > 0 and <= 4 &&
+               ushort.TryParse(trimmed, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value);
+    }
 
     /// <summary>
     /// Walks VLAN/QinQ tags and returns the inner EtherType plus the offset of the L3 header.

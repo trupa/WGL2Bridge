@@ -30,7 +30,7 @@ public sealed class Bridge : IAsyncDisposable
     private readonly TapAdapter _tap;
     private readonly TapNetworkConfigurator _networkConfigurator;
     private readonly IBridgeTransport _transport;
-    private readonly IndustrialFilter _filter;
+    private readonly FrameFilter _filter;
     private readonly MacTable _macTable;
     private readonly LoopDetector _loopDetector;
     private readonly WireGuardInterface _tunnel;
@@ -75,7 +75,7 @@ public sealed class Bridge : IAsyncDisposable
         _tap = new TapAdapter(tapDevicePath);
         _networkConfigurator = new TapNetworkConfigurator(config, tapAdapterId);
         _transport = TransportFactory.Create(config);
-        _filter = new IndustrialFilter(config.DropUdpPorts, config.AllowVlans);
+        _filter = new FrameFilter(config.DropEtherTypes, config.DropUdpPorts, config.AllowVlans);
         _macTable = new MacTable(2048, TimeSpan.FromSeconds(config.MacAgingSeconds));
         _loopDetector = new LoopDetector();
         _broadcastTap = new BroadcastLimiter(config.MaxBroadcastPps);

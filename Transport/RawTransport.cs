@@ -10,8 +10,8 @@ namespace WGL2Bridge.Transport;
 /// <summary>
 /// Raw encapsulation: the bare Ethernet frame is the payload of a raw IP packet with a configurable
 /// protocol number. The kernel adds the outer IP header, so there is no constant headroom. This mode
-/// has no kernel-native Linux peer equivalent; the peer must run matching software. Prefer VXLAN or
-/// GRETAP for production.
+/// has no kernel-native Linux peer equivalent; the peer must run matching software. Prefer VXLAN for
+/// production.
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class RawTransport : IBridgeTransport

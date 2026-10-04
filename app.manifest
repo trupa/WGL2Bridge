@@ -5,7 +5,7 @@
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
         <!-- Always prompt for elevation: the bridge needs admin for the TAP device and
-             (for GreTap/Raw) raw sockets, plus netsh/registry configuration. -->
+             (for Raw) raw sockets, plus netsh/registry configuration. -->
         <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
       </requestedPrivileges>
     </security>
