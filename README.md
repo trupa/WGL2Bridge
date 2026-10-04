@@ -273,7 +273,7 @@ sc.exe delete WGL2Bridge
 - Setup a Peer running Ubuntu Linux on a Raspberry Pi 5 with ubuntu.
 
 - The peer must have a bridge configured and the adapter to the lan in it. Example netplan file ("/etc/netplan/50-cloud-init.yaml"):
-	```
+```
 network:
   version: 2
   ethernets:
@@ -286,7 +286,7 @@ network:
       dhcp4: true
       addresses:
         - 192.168.1.2/24
-	```
+```
 - Setup a network dispatcher script ("/etc/networkd-dispatcher/routable.d/99-vxlan-bridge"): 
 ```
   #!/bin/bash
