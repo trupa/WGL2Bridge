@@ -41,20 +41,35 @@ onto the physical LAN.
 
 ## Prerequisites
 
+### Running WGL2Bridge
+
+> **The only component you must install to run WGL2Bridge is the TAP-Windows6 adapter driver — nothing
+> else.** The published executable is self-contained (NativeAOT): it does **not** need the .NET runtime,
+> the .NET SDK, the C++ Build Tools, or any other runtime dependency.
+
 - Windows 10/11 x64, **run elevated** (raw sockets and raw TAP device access require elevation).
-- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
-- **Visual Studio C++ Build Tools** (the `Desktop development with C++` workload) for NativeAOT linking.
 - **TAP-Windows6** driver installed (e.g. [OpenVPN tap-windows6](https://github.com/OpenVPN/tap-windows6)),
   with the adapter renamed to match `tapName`. To let WGL2Bridge create the adapter itself
   (`createTapIfMissing: true`), OpenVPN's `tapctl.exe` (OpenVPN 2.5+, in `C:\Program Files\OpenVPN\bin`)
   is used when available; otherwise the driver package (`OemVista.inf`) and its devcon-style installer
   (`tapinstall.exe` / `devcon.exe`) must be present — set `tapDriverInfPath` and
   `tapInstallToolPath` if they aren't in the standard locations.
+
+You also need a tunnel to carry the encapsulated frames:
+
 - **NetBird** (or a plain WireGuard interface) with an active tunnel; name it to match
   `tunnelInterfaceName`, or set `peerAddress` explicitly. On Windows the adapter is usually named
   `wt0` for NetBird or the tunnel name for a plain WireGuard config; check with
   `netsh interface show interface`. A plain WireGuard tunnel needs only `peerAddress` (leave
   `peerName` null) and does not require the NetBird CLI.
+
+### Building from source
+
+Building/publishing from source additionally requires the following **build-time only** tools (they are
+not needed to run a published binary):
+
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
+- **Visual Studio C++ Build Tools** (the `Desktop development with C++` workload) for NativeAOT linking.
 
 ## Build / publish
 
