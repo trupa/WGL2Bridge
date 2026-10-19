@@ -29,7 +29,9 @@ public sealed class WireGuardInterface
     {
         NetworkInterface nic = NetworkInterface.GetAllNetworkInterfaces()
             .FirstOrDefault(n => string.Equals(n.Name, Name, StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException($"Tunnel interface '{Name}' not found.");
+            ?? throw new InvalidOperationException(
+                $"Tunnel interface '{Name}' not found. Set 'tunnelInterfaceName' to the WireGuard/NetBird adapter " +
+                "(check with 'netsh interface show interface').");
 
         if (!string.IsNullOrWhiteSpace(config.TunnelLocalAddress))
         {

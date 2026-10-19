@@ -25,7 +25,7 @@ namespace WGL2Bridge.Core;
 public sealed class Bridge : IAsyncDisposable
 {
     private readonly BridgeConfig _config;
-    private IPAddress _peerAddress;
+    private IPAddress? _peerAddress;
     private readonly IPeerProvider _peerProvider;
     private readonly TapAdapter _tap;
     private readonly TapNetworkConfigurator _networkConfigurator;
@@ -64,7 +64,7 @@ public sealed class Bridge : IAsyncDisposable
     /// destroyed/recreated or the peer address changing.</summary>
     public Bridge(
         BridgeConfig config,
-        IPAddress peerAddress,
+        IPAddress? peerAddress,
         IPeerProvider peerProvider,
         string tapDevicePath,
         string tapAdapterId)
@@ -216,7 +216,13 @@ public sealed class Bridge : IAsyncDisposable
     private void OpenSession()
     {
         _tunnel.Resolve(_config);
+
+        // The peer is resolved here (not only at process start) so a tunnel/overlay that is not
+        // up yet — e.g. NetBird starting after this service — is a recoverable condition that is
+        // retried, rather than an immediate process exit.
         RefreshPeer();
+        IPAddress peerAddress = _peerAddress
+            ?? throw new IOException("Peer is not resolved yet; waiting for the overlay to become available.");
 
         IPAddress localIp = _tunnel.LocalAddress!;
         int tunnelMtu = _tunnel.Mtu;
@@ -233,7 +239,7 @@ public sealed class Bridge : IAsyncDisposable
         int innerHeader = _config.AssumeVlanTagged ? 18 : 14;
         BridgeLog.Info($"TAP MTU {tapMtu} (tunnel MTU {tunnelMtu} - {_transport.EncapsulationOverhead} encapsulation - {innerHeader} Ethernet header).");
 
-        _transport.Open(localIp, _peerAddress);
+        _transport.Open(localIp, peerAddress);
         BridgeLog.Info($"Encapsulation active: {_transport.Description}; egress pinned to tunnel address '{localIp}'.");
     }
 
@@ -242,13 +248,19 @@ public sealed class Bridge : IAsyncDisposable
         PeerInfo? fresh = _peerProvider.Resolve();
         if (fresh is null)
         {
+            if (_peerAddress is null)
+            {
+                throw new IOException(
+                    "Peer is not resolved yet (no 'PeerAddress'/'PeerName' match and overlay discovery unavailable).");
+            }
+
             BridgeLog.Debug($"Peer re-resolution failed; keeping cached peer '{_peerAddress}'.");
             return;
         }
 
         if (!fresh.Address.Equals(_peerAddress))
         {
-            BridgeLog.Info($"Peer address changed: '{_peerAddress}' -> '{fresh.Address}'.");
+            BridgeLog.Info($"Peer address changed: '{_peerAddress?.ToString() ?? "(none)"}' -> '{fresh.Address}'.");
             _peerAddress = fresh.Address;
         }
 
@@ -593,7 +605,7 @@ public sealed class Bridge : IAsyncDisposable
 
     /// <summary>Returns a plain-text snapshot of the bridge counters for the metrics endpoint.</summary>
     public string GetMetricsSnapshot() =>
-        $"peer {_peerAddress}\n" +
+        $"peer {(_peerAddress?.ToString() ?? "(unresolved)")}\n" +
         $"transport {_transport.Mode}\n" +
         $"tap_read {Interlocked.Read(ref _tapFramesRead)}\n" +
         $"tap_forwarded {Interlocked.Read(ref _tapForwarded)}\n" +
@@ -632,7 +644,7 @@ public sealed class Bridge : IAsyncDisposable
         }
         else
         {
-            BridgeLog.Warning($"Tunnel lost: {message}. Reconnecting in {_config.ReconnectDelaySeconds}s.");
+            BridgeLog.Warning($"Session failed: {message} Reconnecting in {_config.ReconnectDelaySeconds}s.");
             lastFailure = message;
         }
     }

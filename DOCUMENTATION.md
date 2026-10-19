@@ -289,15 +289,16 @@ the adapter being destroyed/recreated or the peer address changing.
 **Constructor** `Bridge(config, peerAddress, peerProvider, tapDevicePath, tapAdapterId)`
 Builds all collaborators: `TapAdapter`, `TapNetworkConfigurator`, `IBridgeTransport` (via factory),
 `FrameFilter`, `MacTable` (capacity 2048), `LoopDetector`, two `BroadcastLimiter`s, and a
-`WireGuardInterface` named from config.
+`WireGuardInterface` named from config. `peerAddress` is nullable: it may be unresolved at startup
+when the overlay is not up yet, in which case the session loop resolves it later.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
 | `RunAsync(CancellationToken)` | `async Task` | Main loop: open session → start pumps → await first fault → drain → close → delay → reconnect, until cancellation or stop. |
 | `AwaitFirstFaultAsync(Task[])` | `static async Task` | Waits for the first pump to fault/cancel, then rethrows. Ignores pumps that complete normally. |
 | `RenewDhcpAfterForwardingStartedAsync(ct)` | `async Task` | Waits a short delay after recovery, then triggers `ipconfig /renew` so DHCPDISCOVER has a forwarding path. |
-| `OpenSession()` | `void` | Resolves tunnel + peer, computes buffer size, opens the TAP, logs TAP status/MAC, derives & applies TAP MTU, opens the transport bound to the local tunnel IP. |
-| `RefreshPeer()` | `void` | Re-resolves the peer; updates the cached address on change; throws if the overlay reports the peer not connected. |
+| `OpenSession()` | `void` | Resolves the tunnel, re-resolves the peer (throwing a recoverable `IOException` if it is still unavailable), computes buffer size, opens the TAP, logs TAP status/MAC, derives & applies TAP MTU, opens the transport bound to the local tunnel IP. |
+| `RefreshPeer()` | `void` | Re-resolves the peer; updates the cached address on change. Throws `IOException` when no cached peer exists and resolution fails, or when the overlay reports the peer not connected — both are retried by the session loop. |
 | `CloseSession()` | `void` | Closes the transport and disposes the TAP adapter. |
 | `LogTapOperationalStatus()` | `void` | Enumerates the TAP NIC and logs its operational status and IPv4 addresses (warns if not `Up`). |
 | `PumpTapToTunnel(ct)` | `async Task` | The TAP → tunnel forwarding pump (see [§5](#5-data-flow-internals-two-pumps)). |
@@ -839,6 +840,12 @@ Then per direction:
   `LogSessionFailure` (repeated identical messages de-duplicated), session torn down, then retried
   after `reconnectDelaySeconds`.
 - **Peer not connected** → `RefreshPeer` throws, deferring the session until the overlay is up.
+- **Peer unresolved at startup** → `Program.RunBridge` only logs a warning and continues; the
+  session loop re-resolves the peer each attempt, so a NetBird overlay that starts after the bridge
+  does not cause an immediate process exit.
+- **Tunnel interface missing at startup** → `WireGuardInterface.Resolve` throws a descriptive
+  `InvalidOperationException`; `Bridge.RunAsync` catches it, logs it and retries after
+  `reconnectDelaySeconds`, so a tunnel created later (e.g. by NetBird) is picked up automatically.
 - **Tunnel down/missing** → `PumpInterfaceWatch` throws when the tunnel IP is no longer bindable.
 - **Dead tunnel** → `PumpHealthCheck` throws when NetBird reports the peer disconnected, or when
   frames are being forwarded but no inbound traffic arrives within the check window.

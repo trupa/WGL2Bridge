@@ -16,8 +16,9 @@ namespace WGL2Bridge;
 
 /// <summary>
 /// Entry point. Supports console mode (default), '--service' (run under the SCM) and '--check'
-/// (validate configuration and resolution without opening devices). Misconfiguration exits with
-/// code 1 — it never retries forever.
+/// (validate configuration and resolution without opening devices). Static misconfiguration exits
+/// with code 1; runtime conditions such as a missing tunnel adapter or an unresolved peer are
+/// treated as recoverable and retried by the bridge session loop.
 /// </summary>
 public static class Program
 {
@@ -175,14 +176,27 @@ public static class Program
 
         IPeerProvider peerProvider = new PeerResolver(config, new NetbirdPeerProvider(netbird));
 
-        PeerInfo? peer = peerProvider.Resolve();
-        if (peer is null)
+        // Peer resolution is best-effort at startup: the overlay or tunnel adapter may simply not
+        // be up yet (for example when NetBird starts after this service). The bridge session loop
+        // re-resolves the peer and retries, so a missing peer/tunnel must not abort the process.
+        PeerInfo? peer = null;
+        try
         {
-            BridgeLog.Error("Unknown peer: no 'PeerAddress'/'PeerName' resolved and overlay discovery failed.");
-            throw new InvalidOperationException("Unknown peer.");
+            peer = peerProvider.Resolve();
+        }
+        catch (Exception ex)
+        {
+            BridgeLog.Warning($"Peer resolution failed: {ex.Message}");
         }
 
-        BridgeLog.Debug($"Peer resolved to '{peer.Address}' (connected={peer.Connected}).");
+        if (peer is null)
+        {
+            BridgeLog.Warning("Peer not resolved yet (no 'PeerAddress'/'PeerName' match and overlay discovery unavailable); waiting and retrying.");
+        }
+        else
+        {
+            BridgeLog.Debug($"Peer resolved to '{peer.Address}' (connected={peer.Connected}).");
+        }
 
         if (!config.PeerSourceValidation)
         {
@@ -215,7 +229,7 @@ public static class Program
         networkConfigurator.ApplyRouteIsolation();
         networkConfigurator.ConfigureAddress();
 
-        await using var bridge = new Bridge(config, peer.Address, peerProvider, tapInfo.DevicePath, tapInfo.AdapterId);
+        await using var bridge = new Bridge(config, peer?.Address, peerProvider, tapInfo.DevicePath, tapInfo.AdapterId);
 
         using var metricsCts = new CancellationTokenSource();
         Task metricsTask = config.MetricsPort > 0
