@@ -8,9 +8,10 @@ using WGL2Bridge.Platform;
 namespace WGL2Bridge.Netbird;
 
 /// <summary>
-/// Wraps the NetBird CLI for runtime discovery. The authoritative peer address is the configured
-/// 'PeerAddress'; the CLI is used to (1) verify daemon connectivity and (2) discover a peer IP when
-/// none is configured. Discovery parsing is tolerant (JsonDocument, not a fixed schema) because the
+/// Wraps the NetBird CLI for runtime discovery. The CLI is used to (1) verify daemon connectivity
+/// and (2) resolve the configured 'PeerName' FQDN to a peer IP. Only an exact FQDN match is accepted;
+/// it never substitutes another connected peer, so a typo or a missing peer cannot bridge to the
+/// wrong machine. Discovery parsing is tolerant (JsonDocument, not a fixed schema) because the
 /// NetBird CLI JSON shape is not version-stable.
 /// </summary>
 [SupportedOSPlatform("windows")]
@@ -107,6 +108,13 @@ public sealed class NetbirdStatus
     {
         peer = null;
 
+        // Without a configured name there is no identity to verify against. Never pick an
+        // arbitrary peer: a missing or typo'd name must not silently bridge to another machine.
+        if (string.IsNullOrWhiteSpace(peerName))
+        {
+            return false;
+        }
+
         try
         {
             using var document = JsonDocument.Parse(json);
@@ -129,7 +137,6 @@ public sealed class NetbirdStatus
                 return false;
             }
 
-            IPAddress? fallback = null;
             foreach (JsonElement item in details.EnumerateArray())
             {
                 if (item.ValueKind != JsonValueKind.Object)
@@ -161,29 +168,18 @@ public sealed class NetbirdStatus
                     continue;
                 }
 
-                bool connected = item.TryGetProperty("status", out JsonElement status) &&
-                                 status.ValueKind == JsonValueKind.String &&
-                                 string.Equals(status.GetString(), "Connected", StringComparison.OrdinalIgnoreCase);
-
-                if (peerName is not null &&
-                    item.TryGetProperty("fqdn", out JsonElement fqdn) &&
+                // Exact FQDN match only. Other peers — even connected ones — are ignored.
+                if (item.TryGetProperty("fqdn", out JsonElement fqdn) &&
                     fqdn.ValueKind == JsonValueKind.String &&
                     string.Equals(fqdn.GetString(), peerName, StringComparison.OrdinalIgnoreCase))
                 {
+                    bool connected = item.TryGetProperty("status", out JsonElement status) &&
+                                     status.ValueKind == JsonValueKind.String &&
+                                     string.Equals(status.GetString(), "Connected", StringComparison.OrdinalIgnoreCase);
+
                     peer = new PeerInfo(ip, connected);
                     return true;
                 }
-
-                if (connected)
-                {
-                    fallback ??= ip;
-                }
-            }
-
-            if (fallback is not null)
-            {
-                peer = new PeerInfo(fallback, true);
-                return true;
             }
 
             return false;

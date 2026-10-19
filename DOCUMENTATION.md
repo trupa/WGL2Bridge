@@ -101,7 +101,7 @@ WGL2Bridge/
 ├─ Peer/
 │  ├─ IPeerProvider.cs            PeerInfo record + provider interface
 │  ├─ NetbirdPeerProvider.cs      NetBird-backed provider
-│  └─ PeerResolver.cs             Discovery + pinned-address fallback
+│  └─ PeerResolver.cs             Exact-name/address peer resolution
 │
 ├─ Platform/
 │  ├─ Ipv4Cidr.cs                 IPv4/CIDR parsing + subnet-mask conversion
@@ -402,9 +402,9 @@ Constants: `GenericRead`, `GenericWrite`, `FileShareRead`, `FileShareWrite`, `Op
 #### `NetbirdStatus` (`Netbird/NetbirdStatus.cs`)
 
 `[SupportedOSPlatform("windows")] public sealed class NetbirdStatus` — wraps the NetBird CLI. The
-authoritative peer address is `PeerAddress`; the CLI is used only to (1) verify daemon connectivity
-and (2) discover a peer when none is configured. JSON parsing is tolerant (`JsonDocument`) because
-the CLI schema is not version-stable.
+CLI is used to (1) verify daemon connectivity and (2) resolve the configured `PeerName` FQDN to a
+peer IP. Only an exact FQDN match is accepted; JSON parsing is tolerant (`JsonDocument`) because the
+CLI schema is not version-stable.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
@@ -413,7 +413,7 @@ the CLI schema is not version-stable.
 | `ResolveCliPath(string?)` | `static string?` | Uses the configured path if valid, else searches `PATH`, then `C:\Program Files\NetBird` and `(x86)`. |
 | `IsConnected()` | `bool` | Runs `netbird status`; true when exit code 0 and output contains "Connected" (case-insensitive). |
 | `TryDiscoverPeer()` | `PeerInfo?` | Tries `status --json` then `peers list --json`, parsing with `TryParsePeerJson`; returns the first successful result. |
-| `TryParsePeerJson(json, peerName, out PeerInfo?)` | `static bool` | Parses peers from either schema shape (`peers.details[]` or `peers[]`), strips `/prefix` from `netbirdIp`, prefers an FQDN match on `peerName`, else falls back to any `Connected` peer. Tolerates `JsonException`. |
+| `TryParsePeerJson(json, peerName, out PeerInfo?)` | `static bool` | Parses peers from either schema shape (`peers.details[]` or `peers[]`), strips `/prefix` from `netbirdIp`, and returns **only** an exact FQDN match on `peerName`. Returns false when `peerName` is empty or unmatched — it never falls back to another (even connected) peer. Tolerates `JsonException`. |
 
 ---
 
@@ -518,11 +518,12 @@ by the NetBird daemon CLI. `Name => "NetBird"`; `Resolve()` delegates to `netbir
 #### `PeerResolver` (`Peer/PeerResolver.cs`)
 
 `public sealed class PeerResolver(BridgeConfig config, IPeerProvider overlay) : IPeerProvider`
-— composes overlay discovery with the pinned `PeerAddress`. Resolution precedence:
+— resolves the configured peer without guessing. Resolution precedence:
 
-1. If `PeerName` is set → overlay discovery first.
-2. Else if `PeerAddress` is set → parse as IP, or resolve the hostname via DNS (IPv4).
-3. Else → overlay discovery (any connected peer).
+1. If `PeerName` is set → overlay discovery, accepting **only** an exact FQDN match.
+2. If `PeerAddress` is set (or the named peer was not found) → parse as IP, or resolve the hostname
+   via DNS (IPv4).
+3. Otherwise → `null` (the caller logs and waits); it never selects an arbitrary connected peer.
 
 `Name => overlay.Name`.
 
@@ -840,6 +841,9 @@ Then per direction:
   `LogSessionFailure` (repeated identical messages de-duplicated), session torn down, then retried
   after `reconnectDelaySeconds`.
 - **Peer not connected** → `RefreshPeer` throws, deferring the session until the overlay is up.
+- **Configured peer not found** → `PeerResolver` returns `null` (never a different connected peer);
+  the session logs the condition and retries, so a typo or a missing peer cannot bridge to the wrong
+  machine.
 - **Peer unresolved at startup** → `Program.RunBridge` only logs a warning and continues; the
   session loop re-resolves the peer each attempt, so a NetBird overlay that starts after the bridge
   does not cause an immediate process exit.

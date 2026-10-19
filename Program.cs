@@ -191,7 +191,13 @@ public static class Program
 
         if (peer is null)
         {
-            BridgeLog.Warning("Peer not resolved yet (no 'PeerAddress'/'PeerName' match and overlay discovery unavailable); waiting and retrying.");
+            string target = !string.IsNullOrWhiteSpace(config.PeerName)
+                ? $"peer '{config.PeerName}'"
+                : !string.IsNullOrWhiteSpace(config.PeerAddress)
+                    ? $"peer address '{config.PeerAddress}'"
+                    : "peer (no 'PeerName' or 'PeerAddress' configured)";
+
+            BridgeLog.Warning($"Configured {target} is not available; waiting and retrying (no fallback to another peer).");
         }
         else
         {

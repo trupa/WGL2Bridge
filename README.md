@@ -107,17 +107,19 @@ every notable configuration key, the expected type, and how the bridge uses the 
     `peerAddress`.
 
 - peerName (string|null, default: null)
-  - NetBird peer FQDN used during CLI discovery. When set the bridge attempts to discover a peer whose
-    NetBird identity (FQDN) matches this value. If a matching (or any connected) peer is discovered,
-    that peer's IP will be used even if `peerAddress` is configured. Set this to target a specific
-    NetBird peer when multiple peers exist. Leave null when the peer is pinned via `peerAddress`.
+  - NetBird peer FQDN used during CLI discovery. When set, the bridge accepts **only** a peer whose
+    NetBird identity (FQDN) matches this value exactly (case-insensitive). It never falls back to a
+    different connected peer: if no match is found it logs a warning and waits/retries, so a typo or a
+    missing peer can never silently bridge to the wrong machine. Set this to target a specific NetBird
+    peer when multiple peers exist. Leave null when the peer is pinned via `peerAddress`.
 
-Note on peer discovery: the NetBird CLI is only consulted when discovery is actually required — when
-`peerName` is set, or when `peerAddress` is empty. If `peerAddress` is set and `peerName` is null the
-peer is pinned and NetBird is never used: no `netbird status` subprocess is spawned and no NetBird
-warnings are logged. A plain WireGuard tunnel is therefore fully supported — set
-`tunnelInterfaceName` to the WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and
-leave `peerName` null.
+Note on peer discovery: the NetBird CLI is only consulted when `peerName` is set. If `peerAddress` is
+set and `peerName` is null the peer is pinned and NetBird is never used: no `netbird status`
+subprocess is spawned and no NetBird warnings are logged. When `peerName` is set, only an exact FQDN
+match is accepted — the bridge never substitutes another connected peer. If the named peer cannot be
+found it logs the condition and retries; if `peerAddress` is also configured, that explicit address is
+the fallback. A plain WireGuard tunnel is therefore fully supported — set `tunnelInterfaceName` to the
+WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and leave `peerName` null.
 
 - tunnelLocalAddress (string|null, default: null)
   - Optional override for the local tunnel IP address used as the source for encapsulation packets. If null

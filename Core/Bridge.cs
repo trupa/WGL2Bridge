@@ -250,8 +250,14 @@ public sealed class Bridge : IAsyncDisposable
         {
             if (_peerAddress is null)
             {
+                string target = !string.IsNullOrWhiteSpace(_config.PeerName)
+                    ? $"peer '{_config.PeerName}'"
+                    : !string.IsNullOrWhiteSpace(_config.PeerAddress)
+                        ? $"peer address '{_config.PeerAddress}'"
+                        : "peer (no 'PeerName' or 'PeerAddress' configured)";
+
                 throw new IOException(
-                    "Peer is not resolved yet (no 'PeerAddress'/'PeerName' match and overlay discovery unavailable).");
+                    $"Configured {target} could not be resolved; waiting (no fallback to another peer).");
             }
 
             BridgeLog.Debug($"Peer re-resolution failed; keeping cached peer '{_peerAddress}'.");
