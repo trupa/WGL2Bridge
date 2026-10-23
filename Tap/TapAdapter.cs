@@ -35,6 +35,13 @@ public sealed class TapAdapter : IDisposable
     /// <summary>Opens the device, queries its MAC, and forces the media status to connected.</summary>
     public void Open()
     {
+        // Keep the handle across tunnel reconnects. Closing/reopening it toggles the adapter's
+        // media state, which is a Windows network change that can make NetBird reconnect again.
+        if (IsOpen)
+        {
+            return;
+        }
+
         nint raw = WindowsNative.CreateFile(
             DevicePath,
             WindowsNative.GenericRead | WindowsNative.GenericWrite,

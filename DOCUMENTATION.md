@@ -306,7 +306,7 @@ when the overlay is not up yet, in which case the session loop resolves it later
 | `RenewDhcpAfterForwardingStartedAsync(ct)` | `async Task` | Waits a short delay after recovery, then triggers `ipconfig /renew` so DHCPDISCOVER has a forwarding path. |
 | `OpenSession()` | `void` | Resolves the tunnel, re-resolves the peer (throwing a recoverable `IOException` if it is still unavailable), computes buffer size, opens the TAP, logs TAP status/MAC, derives & applies TAP MTU, opens the transport bound to the local tunnel IP. |
 | `RefreshPeer()` | `void` | Re-resolves the peer; updates the cached address on change. Throws `IOException` when no cached peer exists and resolution fails, or when the overlay reports the peer not connected — both are retried by the session loop. |
-| `CloseSession()` | `void` | Closes the transport and disposes the TAP adapter. |
+| `CloseSession()` | `void` | Closes the transport. The TAP handle is kept open across sessions so its media state does not toggle (a Windows network change that can make NetBird reconnect). |
 | `LogTapOperationalStatus()` | `void` | Enumerates the TAP NIC and logs its operational status and IPv4 addresses (warns if not `Up`). |
 | `PumpTapToTunnel(ct)` | `async Task` | The TAP → tunnel forwarding pump (see [§5](#5-data-flow-internals-two-pumps)). |
 | `PumpTunnelToTap(ct)` | `async Task` | The tunnel → TAP forwarding pump. |
@@ -320,7 +320,7 @@ when the overlay is not up yet, in which case the session loop resolves it later
 | `OnLoopDetected()` | `void` | Logs a loop error; sets `_stopRequested` + cancels the session when `StopOnLoopDetected`, else warns and continues. |
 | `LogSessionFailure(Exception, ref string?, int)` | `void` | Logs a session failure, de-duplicating repeated identical messages to `Debug`. |
 | `FormatMac(ReadOnlySpan<byte>)` | `static string` | Formats a 6-byte MAC as `AA:BB:CC:DD:EE:FF`. |
-| `DisposeAsync()` | `ValueTask` | Sets stop, cancels the session, closes the session, disposes the transport. |
+| `DisposeAsync()` | `ValueTask` | Sets stop, cancels the session, closes the session, disposes the transport and the TAP adapter. |
 
 Private counters (all `long`, updated with `Interlocked`): `_tapFramesRead`, `_tapFilterDropped`,
 `_tapMacSuppressed`, `_tapForwarded`, `_tunnelPacketsReceived`, `_tunnelInvalid`,
@@ -595,7 +595,7 @@ mechanism OpenVPN uses — because higher-level APIs don't reliably deliver fram
 | `DevicePath` | `string` (get) | The device path. |
 | `MacAddress` | `ReadOnlySpan<byte>` (get) | Driver-reported MAC, refreshed on each open. |
 | `IsOpen` | `bool` (get) | True while the handle is valid. |
-| `Open()` | `void` | `CreateFile` with overlapped flag, binds the handle to the thread pool, queries the MAC, forces media status connected. |
+| `Open()` | `void` | `CreateFile` with overlapped flag, binds the handle to the thread pool, queries the MAC, forces media status connected. Idempotent: returns immediately if the handle is already open, so the adapter's media state is not toggled on every tunnel reconnect. |
 | `ReadAsync(buffer, offset, count, ct)` | `ValueTask<int>` | Overlapped read of one frame. |
 | `WriteAsync(buffer, offset, count, ct)` | `ValueTask<int>` | Overlapped write of one frame. |
 | `StartOperation(read, buffer, offset, count, ct)` | `ValueTask<int>` (private, unsafe) | Core machinery: pins the buffer, allocates a `NativeOverlapped`, registers cancellation **before** issuing I/O, handles `ERROR_IO_PENDING` (997), and cancels explicitly if the token fired mid-flight. |

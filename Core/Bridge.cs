@@ -368,7 +368,10 @@ public sealed class Bridge : IAsyncDisposable
     private void CloseSession()
     {
         _transport.Close();
-        _tap.Dispose();
+
+        // The TAP handle is intentionally kept open across sessions: disposing/reopening it toggles
+        // the adapter's media state, which is a Windows network change that can make NetBird bounce
+        // wt0 in a loop. It is disposed once in DisposeAsync.
     }
 
     private void LogTapOperationalStatus()
@@ -756,6 +759,7 @@ public sealed class Bridge : IAsyncDisposable
         _sessionCts?.Cancel();
         CloseSession();
         _transport.Dispose();
+        _tap.Dispose();
         return ValueTask.CompletedTask;
     }
 }
