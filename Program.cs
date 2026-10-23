@@ -232,8 +232,19 @@ public static class Program
         BridgeLog.Debug($"TAP '{tapInfo.Name}' -> device '{tapInfo.DevicePath}' (GUID '{tapInfo.AdapterId}').");
 
         var networkConfigurator = new TapNetworkConfigurator(config, tapInfo.AdapterId);
-        networkConfigurator.ApplyRouteIsolation();
-        networkConfigurator.ConfigureAddress();
+
+        if (config.BridgeSide == BridgeSide.Client)
+        {
+            networkConfigurator.ApplyRouteIsolation();
+            networkConfigurator.ConfigureAddress();
+        }
+        else
+        {
+            BridgeLog.Info(
+                $"Bridge side is 'Lan': '{config.TapName}' is a bridge port, so TAP address configuration " +
+                "and route isolation are skipped (the network bridge owns the LAN address)." +
+                (string.IsNullOrWhiteSpace(config.TapIpAddress) ? string.Empty : " 'tapIpAddress' is ignored in this mode."));
+        }
 
         await using var bridge = new Bridge(config, peer?.Address, peerProvider, tapInfo.DevicePath, tapInfo.AdapterId);
 

@@ -118,7 +118,9 @@ public sealed class Bridge : IAsyncDisposable
 
                 // Renew DHCP only after the forwarding pumps are up; otherwise the DHCPDISCOVER has
                 // no path to the remote server and ipconfig /renew blocks through its discovery timeout.
-                if (recovered && _config.RenewDhcpOnReconnect && string.IsNullOrWhiteSpace(_config.TapIpAddress))
+                // Only the client side has an address on the TAP; the LAN side is a bridge port.
+                if (recovered && _config.BridgeSide == BridgeSide.Client &&
+                    _config.RenewDhcpOnReconnect && string.IsNullOrWhiteSpace(_config.TapIpAddress))
                 {
                     _ = RenewDhcpAfterForwardingStartedAsync(_sessionCts.Token);
                 }
@@ -413,16 +415,17 @@ public sealed class Bridge : IAsyncDisposable
 
                 long nowMs = Environment.TickCount64;
                 if (frame.Length >= Ethernet.HeaderLength)
-                {if (!frame[6..12].SequenceEqual(_tap.MacAddress))
+                {
+                    if (!frame[6..12].SequenceEqual(_tap.MacAddress))
                     {
                         _macTable.Learn(frame[6..12], MacTable.Port.Tunnel, nowMs);
                     }
                     else if (Interlocked.Exchange(ref _tapMacReflectedLogged, 1) == 0)
                     {
-                        BridgeLog.Warning("Own TAP MAC observed arriving from the tunnel (reflection/loop); not learning it as remote.");
+                        BridgeLog.Warning(
+                            "Own TAP MAC observed arriving from the tunnel (reflection/loop or duplicate MAC on the peer); not learning it as remote.");
                     }
 
-                    _macTable.Learn(frame[6..12], MacTable.Port.Tunnel, nowMs);
                     if (_loopDetector.Observe(frame))
                     {
                         OnLoopDetected();

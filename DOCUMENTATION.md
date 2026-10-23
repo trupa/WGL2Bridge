@@ -238,7 +238,7 @@ Counters use `Interlocked` on `long` fields (no locks) and are read atomically f
 | ------ | ---- | ----------- |
 | `Main(string[] args)` | `static async Task<int>` | Parses args, loads & validates config, initializes logging, dispatches to check/service/console modes. Returns process exit code (`0` ok, `1` fatal/misconfig). Never retries config errors. |
 | `RunCheck(BridgeConfig)` | `static bool` | Dry-run: resolves peer/tunnel/TAP and computes MTU without opening devices. Returns `true` if the configuration resolves. Uses the real transport object (constructing it opens no socket) so the reported MTU matches runtime. |
-| `RunBridge(BridgeConfig, CancellationToken)` | `static async Task` | Resolves runtime state, creates the adapter if needed, applies networking config, runs the `Bridge` plus the optional metrics endpoint. |
+| `RunBridge(BridgeConfig, CancellationToken)` | `static async Task` | Resolves runtime state, creates the adapter if needed, applies networking config (address + route isolation only when `bridgeSide` is `Client`), runs the `Bridge` plus the optional metrics endpoint. |
 | `LoadConfig(string path)` | `static BridgeConfig` | Reads a JSON file and deserializes via `ConfigJsonContext.Default.BridgeConfig`. |
 
 Behavioural notes:
@@ -266,6 +266,13 @@ See [§8](#8-configuration-reference) for the property/knob table.
 | ----- | ------- |
 | `Raw` | Bare Ethernet frame as the payload of a raw IP packet (peer needs matching software). |
 | `Vxlan` | VXLAN (UDP/4789) encapsulation; Linux-kernel-peer compatible. Production default. |
+
+#### `BridgeSide` enum
+
+| Value | Meaning |
+| ----- | ------- |
+| `Client` | Default. The TAP is a standalone adapter: WGL2Bridge configures its address (DHCP or `TapIpAddress`), applies route isolation and renews DHCP after reconnect. |
+| `Lan` | The TAP is a port of a Windows network bridge; the bridge/underlying NIC owns the LAN address. WGL2Bridge skips TAP address configuration, route isolation and DHCP renewal. |
 
 #### `ConfigJsonContext` (`Config/ConfigJsonContext.cs`)
 
@@ -733,6 +740,7 @@ must run matching software.
 | Key | Type | Default | Purpose |
 | --- | ---- | ------- | ------- |
 | `tapName` | string | `"WGBridge-TAP"` | Friendly name of the TAP-Windows6 adapter to use. |
+| `bridgeSide` | `Client` \| `Lan` | `"Client"` | `Client` configures the TAP address/route isolation; `Lan` leaves the TAP (a bridge port) alone. |
 | `tunnelInterfaceName` | string | `"NetBird"` | Friendly name of the WireGuard/NetBird tunnel interface. |
 | `transportMode` | `Raw` \| `Vxlan` | `"Vxlan"` | Outer encapsulation mode. |
 | `peerAddress` | string? | `null` | Peer tunnel IP or hostname (pinned peer). |

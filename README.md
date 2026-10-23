@@ -90,6 +90,14 @@ every notable configuration key, the expected type, and how the bridge uses the 
     the Windows network control panel. When `createTapIfMissing` is true the program will attempt
     to create or rename an adapter to this name.
 
+- bridgeSide (string, default: "Client")
+  - Which side of the connection this instance is on. `Client` treats the TAP as a standalone
+    adapter: WGL2Bridge configures its IPv4 address (DHCP, or `tapIpAddress` when set), applies
+    route isolation and renews DHCP after a reconnect. `Lan` treats the TAP as a port of a Windows
+    network bridge: WGL2Bridge does **not** configure an address or route isolation on the TAP and
+    never runs DHCP on it — the bridge (or the underlying physical NIC) owns the LAN address. Use
+    `Lan` on the machine whose TAP is bridged to its physical NIC.
+
 - tunnelInterfaceName (string, default: "NetBird")
   - The friendly name of the WireGuard/NetBird tunnel interface on the host. The encapsulation socket
     binds to an IP on this interface. If `peerAddress` is omitted the program will attempt discovery
@@ -169,10 +177,10 @@ WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and leave `pee
   - When true the bridge assumes incoming Ethernet frames on the TAP are 802.1Q-tagged and accounts for the 4-byte VLAN tag when deriving the TAP MTU (inner header length = 18 bytes). Set to false for untagged deployments so the derived TAP MTU uses the 14-byte inner Ethernet header. Incorrect setting can cause MTU/fragmentation issues.
 
 - tapIpAddress (string|null, default: null)
-  - Optional static IPv4/CIDR to assign to the TAP adapter (e.g. "192.168.100.2/24"). When null the TAP falls back to DHCP.
+  - Optional static IPv4/CIDR to assign to the TAP adapter (e.g. "192.168.100.2/24"). When null the TAP falls back to DHCP. Only used when `bridgeSide` is `Client`; ignored in `Lan` mode.
 
 - renewDhcpOnReconnect (boolean, default: true)
-  - When true the bridge executes an `ipconfig /renew` against the TAP adapter after a successful reconnect sequence when the TAP is configured for DHCP (i.e. `tapIpAddress` is null). This is done after the forwarding pumps are up so the DHCPDISCOVER packets have a forwarding path.
+  - When true the bridge executes an `ipconfig /renew` against the TAP adapter after a successful reconnect sequence when the TAP is configured for DHCP (i.e. `tapIpAddress` is null). This is done after the forwarding pumps are up so the DHCPDISCOVER packets have a forwarding path. Only applies when `bridgeSide` is `Client`.
 
 - createTapIfMissing (boolean, default: true)
   - When true the program will attempt to create and configure a TAP adapter if an adapter named `tapName` is not present. This requires the TAP driver installers/tools referenced below and elevated permissions.
@@ -336,6 +344,7 @@ on that network. This is the Windows-only shape of the Linux peer above.
 ```json
 {
   "tapName": "WGBridge-TAP",
+  "bridgeSide": "Lan",
   "tunnelInterfaceName": "wt0",
   "transportMode": "Vxlan",
   "vxlanVni": 4096,
@@ -354,6 +363,7 @@ Now bridge the adapter so the whole LAN, not just this host, is exposed:
 ```json
 {
   "tapName": "WGBridge-TAP",
+  "bridgeSide": "Client",
   "tunnelInterfaceName": "wt0",
   "transportMode": "Vxlan",
   "vxlanVni": 4096,
@@ -369,6 +379,9 @@ Notes:
 
 - `vxlanVni` must match on both ends, and each `peerAddress` must point at the **other** machine's
   tunnel IP (or use `peerName` with NetBird discovery). Here A is `100.64.0.1` and B is `100.64.0.2`.
+- Set `bridgeSide` to `Lan` on the bridged machine (B) and `Client` on the other (A). In `Lan` mode
+  WGL2Bridge leaves the TAP's IP configuration alone so the bridge keeps the LAN's address and
+  default route; running DHCP on a bridged TAP can otherwise pull an address across the tunnel.
 - No firewall rule is required when the underlay is NetBird/WireGuard: the encapsulated packets ride
   inside WireGuard's UDP.
 - Run both ends elevated (the manifest prompts for it).

@@ -14,6 +14,23 @@ public enum TransportMode
     Vxlan,
 }
 
+/// <summary>Which side of the bridged segment this instance represents.</summary>
+public enum BridgeSide
+{
+    /// <summary>
+    /// Client/access side: the TAP is a standalone adapter, so WGL2Bridge configures its IPv4
+    /// address (DHCP or <c>TapIpAddress</c>), applies route isolation and renews DHCP after a
+    /// reconnect.
+    /// </summary>
+    Client,
+
+    /// <summary>
+    /// LAN/uplink side: the TAP is a port of a Windows network bridge and the bridge (or the
+    /// underlying NIC) owns the LAN address. WGL2Bridge leaves the TAP's IP configuration alone.
+    /// </summary>
+    Lan,
+}
+
 /// <summary>
 /// Single source of truth for WGL2Bridge configuration. Every field has a sensible default;
 /// <see cref="Validate"/> fails fast on misconfiguration so a bad config exits with code 1 instead
@@ -88,6 +105,14 @@ public sealed record BridgeConfig
     /// </summary>
     public string? TapIpAddress { get; init; }
 
+    /// <summary>
+    /// Which side of the connection this instance is on. <see cref="Config.BridgeSide.Client"/>
+    /// configures the TAP address (DHCP or <see cref="TapIpAddress"/>) and route isolation;
+    /// <see cref="Config.BridgeSide.Lan"/> assumes the TAP is a port of a network bridge and leaves
+    /// its IP configuration alone, so the bridged segment keeps the LAN's addressing.
+    /// </summary>
+    public BridgeSide BridgeSide { get; init; } = BridgeSide.Client;
+
     /// <summary>Trigger 'ipconfig /renew' on the TAP after a reconnect (DHCP mode only).</summary>
     public bool RenewDhcpOnReconnect { get; init; } = true;
 
@@ -141,6 +166,8 @@ public sealed record BridgeConfig
             errors.Add("'TunnelInterfaceName' must not be empty.");
         if (!Enum.IsDefined(TransportMode))
             errors.Add($"'TransportMode' value '{TransportMode}' is not a valid mode.");
+        if (!Enum.IsDefined(BridgeSide))
+            errors.Add($"'BridgeSide' value '{BridgeSide}' is not a valid side.");
         if (VxlanVni is < 0 or > 0xFFFFFF)
             errors.Add("'VxlanVni' must be between 0 and 16777215.");
         if (VxlanDestinationPort is < 1 or > 65535)
