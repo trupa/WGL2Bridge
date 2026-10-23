@@ -55,6 +55,8 @@ public sealed class Bridge : IAsyncDisposable
     private int _firstTapFrameLogged;
     private int _firstTunnelPacketLogged;
     private int _tapMacReflectedLogged;
+    private bool _tunnelUnavailableLogged;
+    private int _lastAppliedMtu = -1;
 
     private CancellationTokenSource? _sessionCts;
     private volatile bool _stopRequested;
@@ -93,10 +95,18 @@ public sealed class Bridge : IAsyncDisposable
         {
             Task[]? pumps = null;
             bool recovered = reconnectAttempt > 0;
+            bool tunnelUnavailable = false;
 
             try
             {
                 OpenSession();
+
+                if (_tunnelUnavailableLogged)
+                {
+                    _tunnelUnavailableLogged = false;
+                    BridgeLog.Info($"Tunnel interface '{_config.TunnelInterfaceName}' is available again.");
+                }
+
                 BridgeLog.Info("Bridge running.");
                 if (recovered)
                 {
@@ -116,16 +126,31 @@ public sealed class Bridge : IAsyncDisposable
                     PumpHealthCheck(_sessionCts.Token),
                 ];
 
-                // Renew DHCP only after the forwarding pumps are up; otherwise the DHCPDISCOVER has
-                // no path to the remote server and ipconfig /renew blocks through its discovery timeout.
+                // Request/renew DHCP only after the forwarding pumps are up; otherwise the
+                // DHCPDISCOVER has no path to the remote server and ipconfig /renew blocks through
+                // its discovery timeout. Do this on every client session, not only after a
+                // recovery: the Windows DHCP client may have fallen back to APIPA (169.254.x.x)
+                // before the tunnel was ready, and needs a nudge once forwarding works.
                 // Only the client side has an address on the TAP; the LAN side is a bridge port.
-                if (recovered && _config.BridgeSide == BridgeSide.Client &&
-                    _config.RenewDhcpOnReconnect && string.IsNullOrWhiteSpace(_config.TapIpAddress))
+                if (_config.BridgeSide == BridgeSide.Client && _config.RenewDhcpOnReconnect &&
+                    string.IsNullOrWhiteSpace(_config.TapIpAddress))
                 {
                     _ = RenewDhcpAfterForwardingStartedAsync(_sessionCts.Token);
                 }
 
                 await AwaitFirstFaultAsync(pumps).ConfigureAwait(false);
+            }
+            catch (TunnelUnavailableException ex)
+            {
+                // NetBird may be reconnecting after a network change. This is not a session
+                // failure: wait briefly and retry as soon as the interface is back.
+                tunnelUnavailable = true;
+                if (!_tunnelUnavailableLogged)
+                {
+                    _tunnelUnavailableLogged = true;
+                    BridgeLog.Info(
+                        $"{ex.Message} Waiting for it to return (if NetBird is reconnecting after a network change, this is expected).");
+                }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || _stopRequested)
             {
@@ -161,10 +186,20 @@ public sealed class Bridge : IAsyncDisposable
 
             if (!cancellationToken.IsCancellationRequested && !_stopRequested)
             {
-                BridgeLog.Debug($"Reconnecting in {_config.ReconnectDelaySeconds}s (attempt {reconnectAttempt}).");
+                // While the tunnel interface is missing, poll quickly so the session resumes as
+                // soon as NetBird finishes reconnecting; otherwise use the configured backoff.
+                TimeSpan delay = tunnelUnavailable
+                    ? TimeSpan.FromSeconds(1)
+                    : TimeSpan.FromSeconds(_config.ReconnectDelaySeconds);
+
+                if (!tunnelUnavailable)
+                {
+                    BridgeLog.Debug($"Reconnecting in {_config.ReconnectDelaySeconds}s (attempt {reconnectAttempt}).");
+                }
+
                 try
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(_config.ReconnectDelaySeconds), cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -203,6 +238,13 @@ public sealed class Bridge : IAsyncDisposable
         {
             // Give the pumps a moment to establish the tunnel before broadcasting DHCPDISCOVER.
             await Task.Delay(TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+
+            if (!TapNeedsDhcpLease())
+            {
+                BridgeLog.Debug($"TAP adapter '{_config.TapName}' already has a usable IPv4 address; skipping DHCP renew.");
+                return;
+            }
+
             _networkConfigurator.RenewDhcp();
         }
         catch (OperationCanceledException)
@@ -213,6 +255,33 @@ public sealed class Bridge : IAsyncDisposable
         {
             BridgeLog.Warning($"DHCP renew failed: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// True when the TAP has no IPv4 address, or only an APIPA (169.254.x.x) address — i.e. when a
+    /// DHCP renew is actually needed. Avoids a network configuration change on every reconnect.
+    /// </summary>
+    private bool TapNeedsDhcpLease()
+    {
+        NetworkInterface? nic = NetworkInterface.GetAllNetworkInterfaces()
+            .FirstOrDefault(n => string.Equals(n.Name, _config.TapName, StringComparison.OrdinalIgnoreCase));
+        if (nic is null)
+        {
+            return false; // adapter gone; the session loop will retry
+        }
+
+        IPAddress[] ipv4 = nic.GetIPProperties().UnicastAddresses
+            .Where(u => u.Address.AddressFamily == AddressFamily.InterNetwork)
+            .Select(u => u.Address)
+            .ToArray();
+
+        return ipv4.Length == 0 || ipv4.All(IsLinkLocal);
+    }
+
+    private static bool IsLinkLocal(IPAddress address)
+    {
+        byte[] bytes = address.GetAddressBytes();
+        return bytes.Length >= 2 && bytes[0] == 169 && bytes[1] == 254;
     }
 
     private void OpenSession()
@@ -237,8 +306,25 @@ public sealed class Bridge : IAsyncDisposable
         LogTapOperationalStatus();
 
         int tapMtu = _networkConfigurator.DeriveTapMtu(tunnelMtu, _transport.EncapsulationOverhead);
-        _networkConfigurator.ApplyMtu(tapMtu);
         int innerHeader = _config.AssumeVlanTagged ? 18 : 14;
+
+        // The client side owns the TAP's IP stack, so its MTU is applied here. In Lan mode the TAP
+        // is a network-bridge port with no IPv4 subinterface of its own: the bridge/NIC owns the
+        // MTU, and netsh would fail with "Element not found".
+        if (_config.BridgeSide == BridgeSide.Client)
+        {
+            // Only re-apply when the derived MTU changes. Running netsh on every reconnect is a
+            // network configuration change that can make NetBird bounce the tunnel again.
+            if (tapMtu != _lastAppliedMtu && _networkConfigurator.ApplyMtu(tapMtu))
+            {
+                _lastAppliedMtu = tapMtu;
+            }
+        }
+        else
+        {
+            BridgeLog.Debug("Bridge side is 'Lan'; not applying the TAP MTU (the network bridge owns the MTU).");
+        }
+
         BridgeLog.Info($"TAP MTU {tapMtu} (tunnel MTU {tunnelMtu} - {_transport.EncapsulationOverhead} encapsulation - {innerHeader} Ethernet header).");
 
         _transport.Open(localIp, peerAddress);
@@ -506,7 +592,8 @@ public sealed class Bridge : IAsyncDisposable
 
             if (!present)
             {
-                throw new IOException($"Tunnel interface '{_config.TunnelInterfaceName}' is down or missing.");
+                throw new TunnelUnavailableException(
+                    $"Tunnel interface '{_config.TunnelInterfaceName}' is down or missing.");
             }
         }
     }

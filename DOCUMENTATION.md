@@ -272,7 +272,7 @@ See [§8](#8-configuration-reference) for the property/knob table.
 | Value | Meaning |
 | ----- | ------- |
 | `Client` | Default. The TAP is a standalone adapter: WGL2Bridge configures its address (DHCP or `TapIpAddress`), applies route isolation and renews DHCP after reconnect. |
-| `Lan` | The TAP is a port of a Windows network bridge; the bridge/underlying NIC owns the LAN address. WGL2Bridge skips TAP address configuration, route isolation and DHCP renewal. |
+| `Lan` | The TAP is a port of a Windows network bridge; the bridge/underlying NIC owns the LAN address. WGL2Bridge skips TAP address configuration, route isolation, MTU and DHCP renewal. |
 
 #### `ConfigJsonContext` (`Config/ConfigJsonContext.cs`)
 
@@ -301,7 +301,7 @@ when the overlay is not up yet, in which case the session loop resolves it later
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
-| `RunAsync(CancellationToken)` | `async Task` | Main loop: open session → start pumps → await first fault → drain → close → delay → reconnect, until cancellation or stop. |
+| `RunAsync(CancellationToken)` | `async Task` | Main loop: open session → start pumps → await first fault → drain → close → delay → reconnect, until cancellation or stop. A missing tunnel interface is treated as a wait state and retried every 1 s rather than counted as a session failure. |
 | `AwaitFirstFaultAsync(Task[])` | `static async Task` | Waits for the first pump to fault/cancel, then rethrows. Ignores pumps that complete normally. |
 | `RenewDhcpAfterForwardingStartedAsync(ct)` | `async Task` | Waits a short delay after recovery, then triggers `ipconfig /renew` so DHCPDISCOVER has a forwarding path. |
 | `OpenSession()` | `void` | Resolves the tunnel, re-resolves the peer (throwing a recoverable `IOException` if it is still unavailable), computes buffer size, opens the TAP, logs TAP status/MAC, derives & applies TAP MTU, opens the transport bound to the local tunnel IP. |
@@ -311,7 +311,7 @@ when the overlay is not up yet, in which case the session loop resolves it later
 | `PumpTapToTunnel(ct)` | `async Task` | The TAP → tunnel forwarding pump (see [§5](#5-data-flow-internals-two-pumps)). |
 | `PumpTunnelToTap(ct)` | `async Task` | The tunnel → TAP forwarding pump. |
 | `PumpStats(ct)` | `async Task` | Periodically logs per-direction counters; no-op if `StatsIntervalSeconds <= 0`. |
-| `PumpInterfaceWatch(ct)` | `async Task` | Liveness: checks the tunnel IP is still bindable (fails → `IOException` → reconnect). Deliberately free of CLI calls so a hung process can't stall it. |
+| `PumpInterfaceWatch(ct)` | `async Task` | Liveness: checks the tunnel IP is still bindable (fails → `TunnelUnavailableException` → prompt retry). Deliberately free of CLI calls so a hung process can't stall it. |
 | `IsLocalAddressPresent(IPAddress)` | `static bool` | Binds a UDP socket to the address to test whether it is still assigned locally (`WSAEADDRNOTAVAIL` ⇒ gone). |
 | `PumpHealthCheck(ct)` | `async Task` | Secondary checks on a fixed 30 s cadence: NetBird peer connected, and a "no inbound traffic while forwarding" heuristic. |
 | `ResolvePeerBoundedAsync(ct)` | `async Task<PeerInfo?>` | Runs peer resolution off-thread with a 10 s timeout so a hung CLI/API can't stall the loop. |
@@ -498,6 +498,8 @@ allocations; tiny critical section because broadcast is not the hot path).
 
 `[SupportedOSPlatform("windows")] public sealed class WireGuardInterface` — resolves the overlay
 tunnel adapter's IPv4 address (socket bind target) and MTU (for TAP MTU derivation).
+`TunnelUnavailableException` (same file) signals that the interface or its IPv4 address is missing —
+expected while NetBird reconnects after a network change; the bridge waits and retries.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
@@ -654,7 +656,7 @@ re-derived and re-applied every session.
 | `ConfigureAddress()` | `void` | Static address if `TapIpAddress` is set, otherwise DHCP. |
 | `SetStatic(address, prefixLength)` | `void` (private) | `netsh … static <ip> <mask> none` — empty default gateway. |
 | `SetDhcp()` | `void` (private) | `netsh … source=dhcp`; treats "already enabled" as benign. |
-| `RenewDhcp()` | `void` | `ipconfig /renew "<tap>"` (used after reconnect to clear stale lease/ARP state). |
+| `RenewDhcp()` | `vobool` | `netsh … mtu=<mtu> store=persistent`; returns false on failure. The bridge only re-runs it when the derived MTU changesle lease/ARP state). |
 | `DeriveTapMtu(tunnelMtu, encapsulationOverhead)` | `int` | `tunnelMtu - overhead - innerHeader` (inner header 18 if VLAN-tagged else 14), clamped 576–9000. |
 | `ApplyMtu(mtu)` | `void` | `netsh … mtu=<mtu> store=persistent` (best-effort, logged). |
 
@@ -761,7 +763,7 @@ must run matching software.
 | `enableLoopDetection` | bool | `true` | Enable 0x88B5 loop probes. |
 | `assumeVlanTagged` | bool | `true` | Use the 18-byte inner header when deriving the TAP MTU. |
 | `tapIpAddress` | string? | `null` | Static IPv4/CIDR for the TAP; null ⇒ DHCP. |
-| `renewDhcpOnReconnect` | bool | `true` | Run `ipconfig /renew` after a successful reconnect (DHCP mode). |
+| `renewDhcpOnReconnect` | bool | `true` | After the pumps start, run `ipconfig /renew` only when the TAP has no usable IPv4 (APIPA/none); recovers a missed DHCP lease without config churn. |
 | `createTapIfMissing` | bool | `true` | Create the TAP adapter if absent. |
 | `tapInstallToolPath` | string? | `null` | Explicit path to `tapctl`/`tapinstall`/`devcon`. |
 | `tapDriverInfPath` | string? | `null` | Explicit path to `OemVista.inf`. |
@@ -858,6 +860,9 @@ Then per direction:
 - **Tunnel interface missing at startup** → `WireGuardInterface.Resolve` throws a descriptive
   `InvalidOperationException`; `Bridge.RunAsync` catches it, logs it and retries after
   `reconnectDelaySeconds`, so a tunnel created later (e.g. by NetBird) is picked up automatically.
+- **Tunnel interface missing** → `TunnelUnavailableException`; treated as a wait state (polled every
+  1 s, not counted as a session failure) so a NetBird reconnect on a network change is absorbed and
+  the session resumes as soon as `wt0` returns.
 - **Tunnel down/missing** → `PumpInterfaceWatch` throws when the tunnel IP is no longer bindable.
 - **Dead tunnel** → `PumpHealthCheck` throws when NetBird reports the peer disconnected, or when
   frames are being forwarded but no inbound traffic arrives within the check window.

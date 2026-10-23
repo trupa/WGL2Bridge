@@ -26,7 +26,8 @@ public enum BridgeSide
 
     /// <summary>
     /// LAN/uplink side: the TAP is a port of a Windows network bridge and the bridge (or the
-    /// underlying NIC) owns the LAN address. WGL2Bridge leaves the TAP's IP configuration alone.
+    /// underlying NIC) owns the LAN address. WGL2Bridge leaves the TAP's IP configuration and MTU
+    /// alone.
     /// </summary>
     Lan,
 }
@@ -109,7 +110,7 @@ public sealed record BridgeConfig
     /// Which side of the connection this instance is on. <see cref="Config.BridgeSide.Client"/>
     /// configures the TAP address (DHCP or <see cref="TapIpAddress"/>) and route isolation;
     /// <see cref="Config.BridgeSide.Lan"/> assumes the TAP is a port of a network bridge and leaves
-    /// its IP configuration alone, so the bridged segment keeps the LAN's addressing.
+    /// its IP configuration and MTU alone, so the bridged segment keeps the LAN's addressing.
     /// </summary>
     public BridgeSide BridgeSide { get; init; } = BridgeSide.Client;
 

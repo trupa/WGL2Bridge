@@ -94,9 +94,9 @@ every notable configuration key, the expected type, and how the bridge uses the 
   - Which side of the connection this instance is on. `Client` treats the TAP as a standalone
     adapter: WGL2Bridge configures its IPv4 address (DHCP, or `tapIpAddress` when set), applies
     route isolation and renews DHCP after a reconnect. `Lan` treats the TAP as a port of a Windows
-    network bridge: WGL2Bridge does **not** configure an address or route isolation on the TAP and
-    never runs DHCP on it — the bridge (or the underlying physical NIC) owns the LAN address. Use
-    `Lan` on the machine whose TAP is bridged to its physical NIC.
+    network bridge: WGL2Bridge does **not** configure an address, route isolation or MTU on the
+    TAP and never runs DHCP on it — the bridge (or the underlying physical NIC) owns the LAN
+    address and MTU. Use `Lan` on the machine whose TAP is bridged to its physical NIC.
 
 - tunnelInterfaceName (string, default: "NetBird")
   - The friendly name of the WireGuard/NetBird tunnel interface on the host. The encapsulation socket
@@ -180,7 +180,7 @@ WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and leave `pee
   - Optional static IPv4/CIDR to assign to the TAP adapter (e.g. "192.168.100.2/24"). When null the TAP falls back to DHCP. Only used when `bridgeSide` is `Client`; ignored in `Lan` mode.
 
 - renewDhcpOnReconnect (boolean, default: true)
-  - When true the bridge executes an `ipconfig /renew` against the TAP adapter after a successful reconnect sequence when the TAP is configured for DHCP (i.e. `tapIpAddress` is null). This is done after the forwarding pumps are up so the DHCPDISCOVER packets have a forwarding path. Only applies when `bridgeSide` is `Client`.
+  - When true, shortly after the forwarding pumps start the bridge checks the TAP's IPv4 address and runs `ipconfig /renew` only if the TAP has no usable address (APIPA 169.254.x.x or none). This recovers a TAP that missed DHCP before the tunnel was ready, without re-running a network configuration change on every reconnect (which can make NetBird bounce the tunnel again). Only applies when `bridgeSide` is `Client` and `tapIpAddress` is null.
 
 - createTapIfMissing (boolean, default: true)
   - When true the program will attempt to create and configure a TAP adapter if an adapter named `tapName` is not present. This requires the TAP driver installers/tools referenced below and elevated permissions.

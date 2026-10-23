@@ -146,8 +146,8 @@ public sealed class TapNetworkConfigurator
         return Math.Clamp(mtu, 576, 9000);
     }
 
-    /// <summary>Persists the given MTU on the TAP adapter via netsh (best-effort, logged).</summary>
-    public void ApplyMtu(int mtu)
+    /// <summary>Persists the given MTU on the TAP adapter via netsh. Returns false on failure.</summary>
+    public bool ApplyMtu(int mtu)
     {
         var (exit, output) = ProcessRunner.Run(
             "netsh.exe",
@@ -156,6 +156,9 @@ public sealed class TapNetworkConfigurator
         if (exit != 0)
         {
             BridgeLog.Warning($"Failed to set MTU {mtu} on '{_config.TapName}': {output.Trim()}");
+            return false;
         }
+
+        return true;
     }
 }

@@ -8,6 +8,16 @@ using WGL2Bridge.Platform;
 namespace WGL2Bridge.Network;
 
 /// <summary>
+/// Raised when the tunnel interface, or its IPv4 address, is not available yet. This is expected
+/// while NetBird/WireGuard is reconnecting after a network change; the bridge waits and retries
+/// instead of treating it as a failed session.
+/// </summary>
+public sealed class TunnelUnavailableException : Exception
+{
+    public TunnelUnavailableException(string message) : base(message) { }
+}
+
+/// <summary>
 /// Resolves the WireGuard overlay tunnel interface: its IPv4 address (the address the encapsulation
 /// socket binds to, pinning egress) and its MTU (used to derive the TAP MTU). MTU is read from
 /// <c>netsh interface ipv4 show interfaces</c> because the managed stack does not expose it.
@@ -29,7 +39,7 @@ public sealed class WireGuardInterface
     {
         NetworkInterface nic = NetworkInterface.GetAllNetworkInterfaces()
             .FirstOrDefault(n => string.Equals(n.Name, Name, StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException(
+            ?? throw new TunnelUnavailableException(
                 $"Tunnel interface '{Name}' not found. Set 'tunnelInterfaceName' to the WireGuard/NetBird adapter " +
                 "(check with 'netsh interface show interface').");
 
@@ -53,7 +63,7 @@ public sealed class WireGuardInterface
             // Prefer a real overlay address over a 169.254.x.x APIPA, which Windows may assign
             // while the interface is up but not yet configured.
             LocalAddress = ipv4.FirstOrDefault(a => !IsLinkLocal(a)) ?? ipv4.FirstOrDefault()
-                ?? throw new InvalidOperationException($"Tunnel interface '{Name}' has no IPv4 address.");
+                ?? throw new TunnelUnavailableException($"Tunnel interface '{Name}' has no IPv4 address.");
         }
 
         Mtu = QueryMtu();
