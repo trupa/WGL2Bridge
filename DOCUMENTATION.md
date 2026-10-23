@@ -646,19 +646,25 @@ falls back to the devcon-style `tapinstall.exe`/`devcon.exe` with `OemVista.inf`
 #### `TapNetworkConfigurator` (`Tap/TapNetworkConfigurator.cs`)
 
 `[SupportedOSPlatform("windows")] public sealed class TapNetworkConfigurator` — applies Windows
-networking quirks around the bridged TAP adapter. Route isolation is one-time/persistent; MTU is
-re-derived and re-applied every session.
+networking quirks around the bridged TAP adapter. Changes are made only when the current setting
+differs, so repeated starts do not generate network-change events that can make NetBird bounce the
+tunnel.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
 | `TapNetworkConfigurator(config, adapterId)` | ctor | Stores config and the adapter GUID. |
-| `ApplyRouteIsolation()` | `void` | Sets interface metric 9999 via `netsh` and writes `DisableDefaultRoutes=1` under the adapter's registry key so a bridged DHCP server can't hijack the default route. |
-| `ConfigureAddress()` | `void` | Static address if `TapIpAddress` is set, otherwise DHCP. |
+| `ApplyRouteIsolation()` | `void` | Sets interface metric 9999 via `netsh` and writes `DisableDefaultRoutes=1` under the adapter's registry key so a bridged DHCP server can't hijack the default route. Skipped when both values are already set. |
+| `ConfigureAddress()` | `void` | Static address if `TapIpAddress` is set, otherwise DHCP. Skipped when the adapter is already configured. |
 | `SetStatic(address, prefixLength)` | `void` (private) | `netsh … static <ip> <mask> none` — empty default gateway. |
 | `SetDhcp()` | `void` (private) | `netsh … source=dhcp`; treats "already enabled" as benign. |
-| `RenewDhcp()` | `vobool` | `netsh … mtu=<mtu> store=persistent`; returns false on failure. The bridge only re-runs it when the derived MTU changesle lease/ARP state). |
+| `RenewDhcp()` | `void` | `ipconfig /renew "<tap>"` (used after reconnect to clear stale lease/ARP state). |
 | `DeriveTapMtu(tunnelMtu, encapsulationOverhead)` | `int` | `tunnelMtu - overhead - innerHeader` (inner header 18 if VLAN-tagged else 14), clamped 576–9000. |
-| `ApplyMtu(mtu)` | `void` | `netsh … mtu=<mtu> store=persistent` (best-effort, logged). |
+| `ApplyMtu(mtu)` | `bool` | `netsh … mtu=<mtu> store=persistent`; returns false on failure. |
+| `ApplyMtuIfNeeded(mtu)` | `bool` | Queries the adapter's current IPv4 MTU and applies only when it differs. |
+| `QueryInterfaceMetric()` | `int?` (private) | Parses `netsh interface ipv4 show interfaces` for the TAP's metric. |
+| `QueryDhcpEnabled()` | `bool?` (private) | Parses `netsh interface ipv4 show config` for the DHCP state. |
+| `HasAddress(address, prefixLength)` | `bool` (private) | True when the TAP already has that IPv4 address and prefix. |
+| `QueryIpv4Mtu()` | `int?` (private) | Reads the adapter's current IPv4 MTU (best effort). |
 
 Constant `IsolationMetric = 9999`.
 

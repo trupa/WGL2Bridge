@@ -313,9 +313,10 @@ public sealed class Bridge : IAsyncDisposable
         // MTU, and netsh would fail with "Element not found".
         if (_config.BridgeSide == BridgeSide.Client)
         {
-            // Only re-apply when the derived MTU changes. Running netsh on every reconnect is a
-            // network configuration change that can make NetBird bounce the tunnel again.
-            if (tapMtu != _lastAppliedMtu && _networkConfigurator.ApplyMtu(tapMtu))
+            // Avoid re-running netsh when the MTU is already set: a config change can make
+            // NetBird bounce the tunnel again. The in-memory cache avoids even querying per
+            // session; ApplyMtuIfNeeded also covers process restarts.
+            if (tapMtu != _lastAppliedMtu && _networkConfigurator.ApplyMtuIfNeeded(tapMtu))
             {
                 _lastAppliedMtu = tapMtu;
             }

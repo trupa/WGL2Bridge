@@ -392,6 +392,10 @@ Notes:
   tunnel, the probe returns and the bridge stops rather than storming.
 - `Raw` works the same way (`"transportMode": "Raw"`, with a matching `rawIpProtocol` on both ends)
   when both ends run this software.
+- If NetBird is set to **reconnect on network change**, creating/configuring the TAP can make it
+  bounce `wt0` several times at startup. WGL2Bridge now changes TAP settings only when they differ
+  and waits for `wt0` to return, but disabling NetBird's network-change reconnect on these hosts
+  removes the churn entirely.
 
 ## License
 
