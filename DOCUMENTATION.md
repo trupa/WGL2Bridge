@@ -96,6 +96,7 @@ WGL2Bridge/
 │  ├─ MacTable.cs                 Learning bridge FDB (open-addressed hash)
 │  ├─ LoopDetector.cs             0x88B5 loop probes
 │  ├─ BroadcastLimiter.cs         Per-second broadcast/multicast rate limiter
+│  ├─ UnknownMacFloodLimiter.cs   Per-destination-MAC flood budget (server mode)
 │  └─ WireGuardInterface.cs       Tunnel adapter IPv4 + MTU resolution
 │
 ├─ Peer/
@@ -295,9 +296,10 @@ the adapter being destroyed/recreated or the peer address changing.
 
 **Constructor** `Bridge(config, peerAddress, peerProvider, tapDevicePath, tapAdapterId)`
 Builds all collaborators: `TapAdapter`, `TapNetworkConfigurator`, `IBridgeTransport` (via factory),
-`FrameFilter`, `MacTable` (capacity 2048), `LoopDetector`, two `BroadcastLimiter`s, and a
-`WireGuardInterface` named from config. `peerAddress` is nullable: it may be unresolved at startup
-when the overlay is not up yet, in which case the session loop resolves it later.
+`FrameFilter`, `MacTable` (capacity 2048), `LoopDetector`, two `BroadcastLimiter`s, an
+`UnknownMacFloodLimiter`, and a `WireGuardInterface` named from config. `peerAddress` is nullable:
+it may be unresolved at startup when the overlay is not up yet, in which case the session loop
+resolves it later.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
@@ -315,7 +317,7 @@ when the overlay is not up yet, in which case the session loop resolves it later
 | `IsLocalAddressPresent(IPAddress)` | `static bool` | Binds a UDP socket to the address to test whether it is still assigned locally (`WSAEADDRNOTAVAIL` ⇒ gone). |
 | `PumpHealthCheck(ct)` | `async Task` | Secondary checks on a fixed 30 s cadence: NetBird peer connected, and a "no inbound traffic while forwarding" heuristic. Heartbeat logged at `Trace`. |
 | `ResolvePeerBoundedAsync(ct)` | `async Task<PeerInfo?>` | Runs peer resolution off-thread with a 10 s timeout so a hung CLI/API can't stall the loop. |
-| `PumpProbes(ct)` | `async Task` | Injects `LoopDetector.BuildProbe` frames into the TAP every `loopProbeIntervalSeconds`; no-op if loop detection is disabled. |
+| `PumpProbes(ct)` | `async Task` | Every `loopProbeIntervalSeconds` builds one `LoopDetector` probe and both writes it to the TAP and sends it over the tunnel (single peer in client mode, all clients via `FloodToClientsAsync` in server mode), so loops formed on the local segment and loops formed through the tunnel are both observable. Rents `transport.HeaderLength + LoopDetector.ProbeLength` and pre-writes the transport header. No-op if loop detection is disabled. |
 | `GetMetricsSnapshot()` | `string` | Returns a `text/plain` snapshot of all counters for the metrics endpoint. In server mode it includes a `client <endpoint> idle_s <n> macs <n>` line per connected client. |
 | `OnLoopDetected()` | `void` | Logs a loop error; sets `_stopRequested` + cancels the session when `StopOnLoopDetected`, else warns and continues. |
 | `LogSessionFailure(Exception, ref string?, int)` | `void` | Logs a session failure, de-duplicating repeated identical messages to `Debug`. |
@@ -325,7 +327,8 @@ when the overlay is not up yet, in which case the session loop resolves it later
 Private counters (all `long`, updated with `Interlocked`): `_tapFramesRead`, `_tapFilterDropped`,
 `_tapMacSuppressed`, `_tapForwarded`, `_tunnelPacketsReceived`, `_tunnelInvalid`,
 `_tunnelFilterDropped`, `_tunnelMacSuppressed`, `_tunnelWritten`, `_broadcastDropped`,
-`_clientForwarded`, `_clientDropped`, `_clientRejected`, `_flooded`, `_lastTapForwardMs`,
+`_clientForwarded`, `_clientDropped`, `_clientRejected`, `_flooded`, `_unknownMacFlooded`,
+`_unknownMacDropped`, `_remoteMacOwnerGone`, `_remoteMacsEvicted`, `_lastTapForwardMs`,
 `_lastTunnelReceiveMs`. One-shot log flags: `_firstTapFrameLogged`,
 `_firstTunnelPacketLogged`, `_tapMacReflectedLogged`.
 
@@ -335,18 +338,56 @@ When `bridgeSide` is `Lan`, the bridge acts as a **multi-client server**:
 
 - Opens the transport with **no fixed peer**; inbound packets from any source are accepted
   (optionally restricted by `allowedClientPeers`).
-- Learns each client's `IPEndPoint` from inbound traffic and maintains a `MAC → client` table
-  (`_remoteMacs`), alongside the existing `MacTable` for LAN-vs-tunnel classification.
-- **TAP → tunnel:** broadcast/multicast and unknown unicast are flooded to all clients; a known
-  remote MAC is sent only to its owning client; a known LAN MAC is left to the Windows bridge.
+- Learns each client's `IPEndPoint` from inbound traffic and maintains a **sticky** `MAC → client`
+  binding table (`_remoteMacs`), alongside the existing `MacTable` for LAN-vs-tunnel classification.
+  `_clientEndpointByAddress` maps a client address to its current endpoint so a client whose UDP
+  source port changed is still matched.
+- **TAP → tunnel:** broadcast/multicast is flooded to all clients (subject to `maxBroadcastPps`); a
+  known remote MAC whose owner is connected is sent only to that client; a known LAN MAC is left to
+  the Windows bridge; unknown unicast — and unicast whose remembered owner is offline — is flooded
+  to all clients but **budgeted per destination MAC** by `UnknownMacFloodLimiter`
+  (`maxUnknownMacFloodPps`, default 10/s). Exceeding the budget drops the client copies only; the
+  frame still reaches the LAN, and a Warning naming the MAC is logged once per MAC.
 - **Tunnel → TAP:** broadcast/multicast is written to the LAN and (optionally) flooded to other
   clients; known LAN unicast is written to the TAP; known remote unicast is forwarded directly to
-  that client; unknown unicast is written to the LAN and flooded to other clients.
-- Clients idle longer than `clientAgingSeconds` are forgotten (with their MACs); at most
-  `maxClients` are tracked.
+  that client; unknown unicast is written to the LAN and flooded to other clients under the same
+  per-MAC budget.
+- **Sticky bindings.** A binding outlives the client's connection: `PruneClientsLocked` removes the
+  client from `_clients` (and `_clientEndpointByAddress`) but keeps `_remoteMacs`; `RemoveMacsFor`
+  no longer exists. Bindings expire only after `remoteMacAgingSeconds` (default 3600, validated to be
+  >= `clientAgingSeconds`) and are capped at `maxRemoteMacs` (default 4096) with least-recently-seen
+  eviction. This is what stops one-way traffic (syslog, SNMP traps, UDP video) to a quiet host from
+  generating an unbounded N-way copy on every frame.
+- `ResolveRemote(mac, nowMs, out endpoint)` returns a `RemoteMacState`: `Connected` (send one copy to
+  the live endpoint), `OwnerDisconnected` (remembered but not connected — falls back to the budgeted
+  flood, which is how a MAC that moved to another client is rediscovered), or `Unknown` (never seen).
+- Clients idle longer than `clientAgingSeconds` stop counting as connected; at most `maxClients` are
+  tracked, least-recently-seen evicted first.
 - `allowClientToClient: false` keeps client-originated traffic on the LAN and never forwards it to
   another client.
-- Counters: `clients`, `client_forwarded`, `client_dropped`, `client_rejected`, `flooded`.
+- Counters: `clients`, `client_forwarded`, `client_dropped`, `client_rejected`, `flooded`,
+  `unknown_mac_flooded`, `unknown_mac_dropped`, `remote_mac_owner_gone`, `remote_macs_evicted`.
+- **Client mode is unaffected:** with a single peer nothing is multiplied, `_remoteMacs` is never
+  populated, and the flood limiter is never consulted — unknown unicast is one `SendAsync`. All of
+  the above is server-mode-only behavior.
+
+Server-mode helpers (all called under `_clientLock` except the pumps and async members):
+
+| Member | Kind | Description |
+| ------ | ---- | ----------- |
+| `SeedClient(IPAddress)` | `void` | Seeds a configured client address so the first frame matches a known client. |
+| `IsClientAllowed(IPAddress)` | `bool` | `allowedClientPeers` check; empty list accepts any peer. |
+| `TouchClient(IPEndPoint, nowMs)` | `void` | Refreshes the client, updates `_clientEndpointByAddress`, evicts the least-recently-seen client at `maxClients` (keeping its MAC bindings), and prunes every 30 s. |
+| `LearnRemoteMac(mac, endpoint, nowMs)` | `void` | Inserts or refreshes a binding; evicts the least-recently-seen binding when at `maxRemoteMacs`. |
+| `EvictOldestRemoteMacLocked()` | `void` | Removes the oldest binding and increments `_remoteMacsEvicted`. |
+| `ResolveRemote(mac, nowMs, out endpoint)` | `RemoteMacState` | `Connected` / `OwnerDisconnected` / `Unknown`; expires bindings older than `remoteMacAgingSeconds` and resolves the owner through `_clientEndpointByAddress`. |
+| `PruneClientsLocked(nowMs)` | `void` | Drops idle clients and their address mapping, then calls `PruneRemoteMacsLocked`. |
+| `ForgetClientAddressLocked(IPEndPoint)` | `void` | Removes the address→endpoint mapping only if it still points at the given endpoint. |
+| `PruneRemoteMacsLocked(nowMs)` | `void` | Expires bindings past `remoteMacAgingSeconds` in one pass, then enforces `maxRemoteMacs`. |
+| `SnapshotClients()` | `IPEndPoint[]` | Copies the live client endpoints (after pruning) for flooding. |
+| `BuildClientReport()` | `string` | `client <endpoint> idle_s <n> macs <n>` per connected client (MACs counted per address). |
+| `FloodToClientsAsync(buffer, offset, length, except, ct)` | `async Task` | Writes the client header once, then sends to every live client except `except`; increments `_flooded`. |
+| `EnsureClientHeader(buffer, frameOffset)` | `void` | Re-writes the transport header immediately before the frame. |
 
 ---
 
@@ -494,7 +535,10 @@ open-addressed hash map keyed on a 48-bit MAC; no steady-state allocations.
 #### `LoopDetector` (`Network/LoopDetector.cs`)
 
 `public sealed class LoopDetector` — inserts 0x88B5 probes tagged with a per-instance random ID;
-only our own probe returning raises the alarm (foreign probe traffic is ignored).
+only our own probe returning raises the alarm (foreign probe traffic is ignored). `Bridge.PumpProbes`
+writes each probe to the TAP **and** sends a copy over the tunnel, so a loop that closes only through
+the tunnel is detected as well; `Observe` is therefore called on both the TAP and the tunnel receive
+paths.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
@@ -514,6 +558,23 @@ allocations; tiny critical section because broadcast is not the hot path).
 | ------ | ---- | ----------- |
 | `BroadcastLimiter(maxPerSecond)` | ctor | `<= 0` disables limiting. |
 | `Allow(nowMs)` | `bool` | Rolls the 1-second window when elapsed, then admits frames up to `_maxPerSecond`. |
+
+#### `UnknownMacFloodLimiter` (`Network/UnknownMacFloodLimiter.cs`)
+
+`public sealed class UnknownMacFloodLimiter` — per-destination-MAC flood budget for unknown unicast,
+**used in Lan/server mode only**. One unresolved MAC floods one copy per connected client, so an
+uncapped flood multiplies LAN ingress by the client count; this caps the multiplication per MAC
+while leaving other MACs untouched. State is a fixed-size open-addressed table, so a flood of
+distinct destination MACs cannot grow memory.
+
+| Member | Kind | Description |
+| ------ | ---- | ----------- |
+| `Capacity` | `const int` = 256 | Destination MACs tracked concurrently; when full, the oldest window is recycled. |
+| `UnknownMacFloodLimiter(maxPerSecond)` | ctor | `<= 0` disables limiting. |
+| `MaxPerSecond` | `int` (get) | Configured budget, echoed in the Warning log line. |
+| `Allow(mac, nowMs)` | `bool` | Convenience overload without the first-clip signal. |
+| `Allow(mac, nowMs, out firstClip)` | `bool` | Rolls the 1-second window per MAC, admits frames up to the budget; `firstClip` is true once per tracked MAC so the caller can log the first drop without flooding the log (`Warned` is never reset until the slot is recycled). |
+| `Hash(ulong)` | `static int` | 64-bit multiply/mix folded into the table index. |
 
 #### `WireGuardInterface` (`Network/WireGuardInterface.cs`)
 
@@ -788,7 +849,10 @@ must run matching software.
 | `allowedClientPeers` | string[] | `[]` | Lan/server mode: optional allow-list of client tunnel IPs; empty accepts any overlay peer. |
 | `allowClientToClient` | bool | `true` | Lan/server mode: allow clients to reach each other through the server. |
 | `maxClients` | int | `64` | Lan/server mode: maximum tracked clients. |
-| `clientAgingSeconds` | int | `300` | Lan/server mode: idle timeout before a client and its MACs are forgotten. |
+| `clientAgingSeconds` | int | `300` | Lan/server mode: idle timeout before a client stops counting as connected (its MAC bindings survive). |
+| `remoteMacAgingSeconds` | int | `3600` | Lan/server mode: how long a client-owned MAC binding outlives the client; must be >= `clientAgingSeconds`. |
+| `maxRemoteMacs` | int | `4096` | Lan/server mode: cap on remembered client MACs (LRU eviction; counted by `remote_macs_evicted`). |
+| `maxUnknownMacFloodPps` | int | `10` | Lan/server mode: per-second flood budget for one unresolved destination MAC; 0 = unlimited. |
 | `reconnectDelaySeconds` | int | `5` | Delay before rebinding after a recoverable failure. |
 | `tunnelHealthCheckSeconds` | int | `30` | Cadence of tunnel-interface reachability checks; 0 disables. |
 | `stopOnLoopDetected` | bool | `true` | Exit when our own loop probe returns. |
@@ -875,7 +939,9 @@ Then per direction:
 
 - **MAC learning / suppression** (`MacTable`): learn source MAC on ingress; suppress unicast frames
   whose destination is known to live on the ingress port; flood broadcast/multicast/unknown.
-- **Loop detection** (`LoopDetector`): own 0x88B5 probe returning triggers `OnLoopDetected`.
+- **Loop detection** (`LoopDetector`): own 0x88B5 probe returning — on the TAP or over the tunnel —
+  triggers `OnLoopDetected`. Probes are emitted on both paths by `PumpProbes`, so bridges that are
+  looped through the tunnel are caught, not just locally looped segments.
 - **Storm control** (`BroadcastLimiter`): multicast/broadcast frames above `maxBroadcastPps` per
   second per direction are dropped silently.
 

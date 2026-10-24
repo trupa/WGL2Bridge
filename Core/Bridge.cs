@@ -64,21 +64,45 @@ public sealed class Bridge : IAsyncDisposable
     private readonly bool _allowClientToClient;
     private readonly int _maxClients;
     private readonly long _clientAgingMs;
-    private readonly long _macAgingMs;
+    private readonly long _remoteMacAgingMs;
+    private readonly int _maxRemoteMacs;
     private readonly HashSet<IPAddress>? _allowedClientPeers;
     private readonly object _clientLock = new();
     private readonly Dictionary<IPEndPoint, long> _clients = new();
+    private readonly Dictionary<IPAddress, IPEndPoint> _clientEndpointByAddress = new();
     private readonly Dictionary<ulong, RemoteMac> _remoteMacs = new();
+    private readonly UnknownMacFloodLimiter _unknownMacFlood;
     private long _lastClientPruneMs;
     private long _clientForwarded;
     private long _clientDropped;
     private long _clientRejected;
     private long _flooded;
+    private long _unknownMacFlooded;
+    private long _unknownMacDropped;
+    private long _remoteMacOwnerGone;
+    private long _remoteMacsEvicted;
 
+    /// <summary>
+    /// A MAC learned from a client, plus the endpoint it was last seen on. The binding is kept after
+    /// the owning client goes idle so one-way traffic to it is not fanned out to every client.
+    /// </summary>
     private struct RemoteMac
     {
         public IPEndPoint Endpoint;
         public long LastSeenMs;
+    }
+
+    /// <summary>Outcome of resolving a destination MAC to an owning client.</summary>
+    private enum RemoteMacState : byte
+    {
+        /// <summary>Never learned from any client.</summary>
+        Unknown,
+
+        /// <summary>Owned by a client that is currently connected.</summary>
+        Connected,
+
+        /// <summary>Owner is remembered but that client is not connected right now.</summary>
+        OwnerDisconnected,
     }
 
     private CancellationTokenSource? _sessionCts;
@@ -101,7 +125,8 @@ public sealed class Bridge : IAsyncDisposable
         _allowClientToClient = config.AllowClientToClient;
         _maxClients = config.MaxClients;
         _clientAgingMs = config.ClientAgingSeconds * 1000L;
-        _macAgingMs = config.MacAgingSeconds * 1000L;
+        _remoteMacAgingMs = config.RemoteMacAgingSeconds * 1000L;
+        _maxRemoteMacs = config.MaxRemoteMacs;
         if (config.AllowedClientPeers.Length > 0)
         {
             _allowedClientPeers = new HashSet<IPAddress>(
@@ -116,6 +141,7 @@ public sealed class Bridge : IAsyncDisposable
         _loopDetector = new LoopDetector();
         _broadcastTap = new BroadcastLimiter(config.MaxBroadcastPps);
         _broadcastTunnel = new BroadcastLimiter(config.MaxBroadcastPps);
+        _unknownMacFlood = new UnknownMacFloodLimiter(config.MaxUnknownMacFloodPps);
         _tunnel = new WireGuardInterface { Name = config.TunnelInterfaceName };
     }
 
@@ -544,14 +570,39 @@ public sealed class Bridge : IAsyncDisposable
                             continue;
                         }
 
-                        IPEndPoint? client = ResolveRemote(Ethernet.ReadMac(frame[..6]), nowMs);
-                        if (client is not null)
+                        ulong destinationMac = Ethernet.ReadMac(frame[..6]);
+                        RemoteMacState state = ResolveRemote(destinationMac, nowMs, out IPEndPoint? client);
+                        if (state == RemoteMacState.Connected && client is not null)
                         {
+                            // Known unicast whose owner is connected: exactly one copy.
                             await _transport.SendToAsync(buffer, headroom, frameLength, client, ct).ConfigureAwait(false);
                         }
                         else
                         {
+                            // Unknown MAC, or a MAC whose remembered owner is offline (it may have
+                            // moved to another client). Flooding is the only option, but it costs one
+                            // copy per client, so each destination MAC gets a bounded budget.
+                            if (state == RemoteMacState.OwnerDisconnected)
+                            {
+                                Interlocked.Increment(ref _remoteMacOwnerGone);
+                            }
+
+                            if (!_unknownMacFlood.Allow(destinationMac, nowMs, out bool firstClip))
+                            {
+                                Interlocked.Increment(ref _unknownMacDropped);
+                                if (firstClip)
+                                {
+                                    BridgeLog.Warning(
+                                        $"Unknown-unicast flood budget exceeded for {FormatMac(frame[..6])} " +
+                                        $"({_unknownMacFlood.MaxPerSecond}/s); dropping further copies " +
+                                        $"(owner {(state == RemoteMacState.OwnerDisconnected ? "disconnected" : "never seen")}).");
+                                }
+
+                                continue;
+                            }
+
                             await FloodToClientsAsync(buffer, headroom, frameLength, except: null, ct).ConfigureAwait(false);
+                            Interlocked.Increment(ref _unknownMacFlooded);
                         }
 
                         Interlocked.Increment(ref _tapForwarded);
@@ -682,8 +733,8 @@ public sealed class Bridge : IAsyncDisposable
                             continue;
                         }
 
-                        IPEndPoint? destClient = ResolveRemote(destMac, nowMs);
-                        if (destClient is not null && !destClient.Equals(source))
+                        RemoteMacState destState = ResolveRemote(destMac, nowMs, out IPEndPoint? destClient);
+                        if (destState == RemoteMacState.Connected && destClient is not null && !destClient.Equals(source))
                         {
                             if (_allowClientToClient)
                             {
@@ -699,14 +750,24 @@ public sealed class Bridge : IAsyncDisposable
                             continue;
                         }
 
-                        // Unknown destination: let the LAN see it (it may answer) and flood the
-                        // remaining clients so a newly seen MAC can be reached.
+                        // Unknown destination (or a remembered owner that is offline): let the LAN see
+                        // it — it may answer — and flood the remaining clients so a newly seen MAC can
+                        // be reached. The client fan-out is budgeted per destination MAC; the single
+                        // copy written to the LAN is not.
                         await _tap.WriteAsync(buffer, frameOffset, packetLength - frameOffset, ct).ConfigureAwait(false);
                         Interlocked.Increment(ref _tunnelWritten);
 
                         if (_allowClientToClient)
                         {
-                            await FloodToClientsAsync(buffer, frameOffset, packetLength - frameOffset, except: source, ct).ConfigureAwait(false);
+                            if (_unknownMacFlood.Allow(destMac, nowMs))
+                            {
+                                await FloodToClientsAsync(buffer, frameOffset, packetLength - frameOffset, except: source, ct).ConfigureAwait(false);
+                                Interlocked.Increment(ref _unknownMacFlooded);
+                            }
+                            else
+                            {
+                                Interlocked.Increment(ref _unknownMacDropped);
+                            }
                         }
 
                         continue;
@@ -781,7 +842,8 @@ public sealed class Bridge : IAsyncDisposable
                 (_serverMode
                     ? $" clients={SnapshotClients().Length} client-forward={Interlocked.Read(ref _clientForwarded)} " +
                       $"client-drop={Interlocked.Read(ref _clientDropped)} rejected={Interlocked.Read(ref _clientRejected)} " +
-                      $"flooded={Interlocked.Read(ref _flooded)}."
+                      $"flooded={Interlocked.Read(ref _flooded)} unknown-flood={Interlocked.Read(ref _unknownMacFlooded)} " +
+                      $"unknown-drop={Interlocked.Read(ref _unknownMacDropped)} mac-evicted={Interlocked.Read(ref _remoteMacsEvicted)}."
                     : "."));
 
             if (_serverMode)
@@ -919,15 +981,34 @@ public sealed class Bridge : IAsyncDisposable
             return;
         }
 
-        byte[] probe = ArrayPool<byte>.Shared.Rent(LoopDetector.ProbeLength);
+        int headerLength = _transport.HeaderLength;
+        byte[] probe = ArrayPool<byte>.Shared.Rent(headerLength + LoopDetector.ProbeLength);
         try
         {
+            _transport.WriteHeader(probe.AsSpan(0, headerLength));
+
             var interval = TimeSpan.FromSeconds(_config.LoopProbeIntervalSeconds);
             while (!ct.IsCancellationRequested)
             {
                 await Task.Delay(interval, ct).ConfigureAwait(false);
-                int length = _loopDetector.BuildProbe(probe.AsSpan(0, LoopDetector.ProbeLength), _tap.MacAddress);
-                await _tap.WriteAsync(probe, 0, length, ct).ConfigureAwait(false);
+
+                int length = _loopDetector.BuildProbe(
+                    probe.AsSpan(headerLength, LoopDetector.ProbeLength), _tap.MacAddress);
+
+                // Inject into the local segment and also send it over the tunnel. Without the
+                // tunnel copy a loop formed through the tunnel could never be observed: the local
+                // probe never returns on the tunnel path. If it loops, it comes back on either
+                // path and LoopDetector.Observe matches this instance's random ID.
+                await _tap.WriteAsync(probe, headerLength, length, ct).ConfigureAwait(false);
+
+                if (_serverMode)
+                {
+                    await FloodToClientsAsync(probe, headerLength, length, except: null, ct).ConfigureAwait(false);
+                }
+                else
+                {
+                    await _transport.SendAsync(probe, headerLength, length, ct).ConfigureAwait(false);
+                }
             }
         }
         finally
@@ -956,6 +1037,10 @@ public sealed class Bridge : IAsyncDisposable
         $"client_dropped {Interlocked.Read(ref _clientDropped)}\n" +
         $"client_rejected {Interlocked.Read(ref _clientRejected)}\n" +
         $"flooded {Interlocked.Read(ref _flooded)}\n" +
+        $"unknown_mac_flooded {Interlocked.Read(ref _unknownMacFlooded)}\n" +
+        $"unknown_mac_dropped {Interlocked.Read(ref _unknownMacDropped)}\n" +
+        $"remote_mac_owner_gone {Interlocked.Read(ref _remoteMacOwnerGone)}\n" +
+        $"remote_macs_evicted {Interlocked.Read(ref _remoteMacsEvicted)}\n" +
         (_serverMode ? BuildClientReport() : string.Empty) +
         $"loop_detected {(_loopDetector.LoopDetected ? 1 : 0)}\n";
 
@@ -1009,12 +1094,17 @@ public sealed class Bridge : IAsyncDisposable
         lock (_clientLock)
         {
             _clients[endpoint] = nowMs;
+            _clientEndpointByAddress[endpoint.Address] = endpoint;
 
             if (_clients.Count > _maxClients)
             {
                 IPEndPoint oldest = _clients.OrderBy(kv => kv.Value).First().Key;
                 _clients.Remove(oldest);
-                RemoveMacsFor(oldest);
+                ForgetClientAddressLocked(oldest);
+
+                // Its MAC bindings are kept on purpose: they still point at the (now disconnected)
+                // owner, so LAN traffic for those MACs is not multiplied across every client, and
+                // they are re-learned the moment that client sends again.
                 BridgeLog.Warning($"Client limit {_maxClients} reached; evicted '{oldest}'.");
             }
 
@@ -1030,26 +1120,72 @@ public sealed class Bridge : IAsyncDisposable
     {
         lock (_clientLock)
         {
+            if (_remoteMacs.TryGetValue(mac, out RemoteMac existing))
+            {
+                existing.Endpoint = endpoint;
+                existing.LastSeenMs = nowMs;
+                _remoteMacs[mac] = existing;
+                return;
+            }
+
+            if (_remoteMacs.Count >= _maxRemoteMacs)
+            {
+                EvictOldestRemoteMacLocked();
+            }
+
             _remoteMacs[mac] = new RemoteMac { Endpoint = endpoint, LastSeenMs = nowMs };
         }
     }
 
-    private IPEndPoint? ResolveRemote(ulong mac, long nowMs)
+    /// <summary>Removes the least recently seen binding; caller holds <see cref="_clientLock"/>.</summary>
+    private void EvictOldestRemoteMacLocked()
+    {
+        ulong oldestMac = 0;
+        long oldestMs = long.MaxValue;
+
+        foreach (KeyValuePair<ulong, RemoteMac> entry in _remoteMacs)
+        {
+            if (entry.Value.LastSeenMs < oldestMs)
+            {
+                oldestMs = entry.Value.LastSeenMs;
+                oldestMac = entry.Key;
+            }
+        }
+
+        _remoteMacs.Remove(oldestMac);
+        Interlocked.Increment(ref _remoteMacsEvicted);
+    }
+
+    /// <summary>
+    /// Resolves a destination MAC to the client that owns it. The binding survives the owner going
+    /// idle (<see cref="_remoteMacAgingMs"/>), so one-way traffic to a quiet host is sent to that one
+    /// client rather than copied to every client. Only a live endpoint is returned for sending.
+    /// </summary>
+    private RemoteMacState ResolveRemote(ulong mac, long nowMs, out IPEndPoint? endpoint)
     {
         lock (_clientLock)
         {
+            endpoint = null;
             if (!_remoteMacs.TryGetValue(mac, out RemoteMac entry))
             {
-                return null;
+                return RemoteMacState.Unknown;
             }
 
-            if (nowMs - entry.LastSeenMs > _macAgingMs)
+            if (nowMs - entry.LastSeenMs > _remoteMacAgingMs)
             {
                 _remoteMacs.Remove(mac);
-                return null;
+                return RemoteMacState.Unknown;
             }
 
-            return entry.Endpoint;
+            // Resolve through the address so a client whose UDP source port changed is still matched.
+            if (_clientEndpointByAddress.TryGetValue(entry.Endpoint.Address, out IPEndPoint? live))
+            {
+                endpoint = live;
+                return RemoteMacState.Connected;
+            }
+
+            endpoint = entry.Endpoint;
+            return RemoteMacState.OwnerDisconnected;
         }
     }
 
@@ -1074,7 +1210,7 @@ public sealed class Bridge : IAsyncDisposable
 
             foreach (KeyValuePair<IPEndPoint, long> client in _clients.OrderBy(kv => kv.Key.ToString()))
             {
-                int macs = _remoteMacs.Count(kv => kv.Value.Endpoint.Equals(client.Key));
+                int macs = _remoteMacs.Count(kv => kv.Value.Endpoint.Address.Equals(client.Key.Address));
                 long idleSeconds = Math.Max(0, (nowMs - client.Value) / 1000);
                 lines.Add($"client {client.Key} idle_s {idleSeconds} macs {macs}");
             }
@@ -1093,20 +1229,54 @@ public sealed class Bridge : IAsyncDisposable
         foreach (IPEndPoint endpoint in expired)
         {
             _clients.Remove(endpoint);
-            RemoveMacsFor(endpoint);
+            ForgetClientAddressLocked(endpoint);
+        }
+
+        PruneRemoteMacsLocked(nowMs);
+    }
+
+    /// <summary>Drops the address→endpoint mapping of a client that is no longer tracked.</summary>
+    private void ForgetClientAddressLocked(IPEndPoint endpoint)
+    {
+        if (_clientEndpointByAddress.TryGetValue(endpoint.Address, out IPEndPoint? current) &&
+            current.Equals(endpoint))
+        {
+            _clientEndpointByAddress.Remove(endpoint.Address);
         }
     }
 
-    private void RemoveMacsFor(IPEndPoint endpoint)
+    /// <summary>
+    /// Expires idle MAC bindings and enforces <see cref="_maxRemoteMacs"/>. Expired bindings are
+    /// forgotten only after <c>remoteMacAgingSeconds</c>, not when their client disconnects.
+    /// </summary>
+    private void PruneRemoteMacsLocked(long nowMs)
     {
-        List<ulong> macs = _remoteMacs
-            .Where(kv => kv.Value.Endpoint.Equals(endpoint))
-            .Select(kv => kv.Key)
-            .ToList();
-
-        foreach (ulong mac in macs)
+        if (_remoteMacs.Count == 0)
         {
-            _remoteMacs.Remove(mac);
+            return;
+        }
+
+        List<ulong>? expired = null;
+        foreach (KeyValuePair<ulong, RemoteMac> entry in _remoteMacs)
+        {
+            if (nowMs - entry.Value.LastSeenMs > _remoteMacAgingMs)
+            {
+                expired ??= new List<ulong>();
+                expired.Add(entry.Key);
+            }
+        }
+
+        if (expired is not null)
+        {
+            foreach (ulong mac in expired)
+            {
+                _remoteMacs.Remove(mac);
+            }
+        }
+
+        while (_remoteMacs.Count > _maxRemoteMacs)
+        {
+            EvictOldestRemoteMacLocked();
         }
     }
 

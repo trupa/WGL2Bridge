@@ -159,7 +159,16 @@ WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and leave `pee
   - Lan/server mode. Maximum number of clients tracked at once; the least-recently-seen client is evicted when exceeded.
 
 - clientAgingSeconds (integer, default: 300)
-  - Lan/server mode. Idle timeout after which a client and its learned MACs are forgotten.
+  - Lan/server mode. Idle timeout after which a client stops counting as connected. Its learned MAC bindings are **not** dropped at the same time — see `remoteMacAgingSeconds`.
+
+- remoteMacAgingSeconds (integer, default: 3600)
+  - Lan/server mode. How long a MAC learned from a client keeps pointing at that client after the client goes idle or disconnects. The binding deliberately outlives `clientAgingSeconds`: while it exists, LAN frames for that MAC go to **one** client instead of being copied to every client. Must be >= `clientAgingSeconds`. Set this too low and one-way traffic (syslog, SNMP traps, UDP video, monitoring) to a quiet host will keep re-flooding the client set.
+
+- maxRemoteMacs (integer, default: 4096)
+  - Lan/server mode. Hard cap on remembered client MACs across all clients; the least-recently-seen binding is evicted when exceeded (`remote_macs_evicted` in the metrics).
+
+- maxUnknownMacFloodPps (integer, default: 10, 0 = unlimited)
+  - Lan/server mode. Per-second flood budget for a **single** destination MAC that cannot be resolved to a connected client (never seen, or its remembered owner is offline). Every such frame costs one copy per connected client, so this caps the multiplication factor. Exceeding it drops the extra client copies (the frame is still written to the LAN) and logs one Warning per MAC. Other MACs are unaffected. Ignored in client mode, where unknown unicast goes to the single peer and is never multiplied.
 
 - reconnectDelaySeconds (integer, default: 5)
   - Delay (seconds) before attempting to rebind or reconnect after a recoverable failure such as transient network error.
@@ -186,7 +195,7 @@ WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and leave `pee
   - Time in seconds after which learned MAC table entries expire if not refreshed. Tune based on network churn.
 
 - enableLoopDetection (boolean, default: true)
-  - If enabled the bridge periodically injects a special 0x88B5 probe frame to detect loops. Disable for environments where loop-detection probes are undesirable.
+  - If enabled the bridge periodically injects a special 0x88B5 probe frame into the local segment and sends a copy of it over the tunnel to detect loops on both paths. Disable for environments where loop-detection probes are undesirable.
 
 - assumeVlanTagged (boolean, default: true)
   - When true the bridge assumes incoming Ethernet frames on the TAP are 802.1Q-tagged and accounts for the 4-byte VLAN tag when deriving the TAP MTU (inner header length = 18 bytes). Set to false for untagged deployments so the derived TAP MTU uses the 14-byte inner Ethernet header. Incorrect setting can cause MTU/fragmentation issues.
@@ -258,7 +267,9 @@ both directions (TAP→tunnel and tunnel→TAP).
 
 - **`dropEtherTypes`** — L2 EtherTypes to block, as hexadecimal text (e.g. `"0x88CC"` blocks LLDP),
   matched on the frame's inner EtherType after any VLAN tags. Empty by default; do not list the
-  loop-probe EtherType `0x88B5`, as blocking it disables loop detection.
+  loop-probe EtherType `0x88B5`, as blocking it disables loop detection, and make sure the far end
+  does not drop `0x88B5` either — a loop through the tunnel is only detected if the probe is
+  allowed to travel both ways.
 - **`dropUdpPorts`** — IPv4/IPv6 UDP **destination** ports to block. Defaults to common consumer
   discovery and host-chatter ports (mDNS 5353, LLMNR 5355, SSDP 1900, WS-Discovery 3702,
   NetBIOS 137/138, Dropbox 17500, Steam 27036).
@@ -270,9 +281,14 @@ both directions (TAP→tunnel and tunnel→TAP).
 ## Loop detection
 
 A broadcast probe with EtherType `0x88B5`, a `WGL2` magic and a per-instance random ID is injected
-into the TAP segment every `loopProbeIntervalSeconds`. If our own probe is observed returning, on the
-TAP or the tunnel path, the bridge logs the loop and (when `stopOnLoopDetected` is true) stops —
-preventing a broadcast storm.
+into the TAP segment every `loopProbeIntervalSeconds`, and an identical copy is sent over the tunnel
+(to the single peer, or to every connected client in server mode).
+
+Both copies matter. The local copy detects a loop that exists on the local segment; the tunnel copy
+detects a loop that only exists *through* the tunnel, where the far end forwards the segment back to
+us — the case that actually causes a broadcast storm across the link. Whichever copy comes back,
+`LoopDetector.Observe` recognises this instance's random ID, the bridge logs the loop and (when
+`stopOnLoopDetected` is true) stops, preventing the storm from propagating further.
 
 ## Windows networking quirks handled
 
@@ -304,6 +320,16 @@ sc.exe delete WGL2Bridge
 includes one `client <ip>:<port> idle_s <n> macs <n>` line per connected client (or `client none`),
 so you can see who is attached. The periodic `Stats:` log also shows the client count and per-client
 detail at `Debug` level.
+
+Server-mode counters worth watching:
+
+| Counter | Meaning |
+| --- | --- |
+| `flooded` | Total frames copied to more than one client (broadcast, multicast, unknown unicast). |
+| `unknown_mac_flooded` | Unknown-unicast frames that were still within their per-MAC budget. |
+| `unknown_mac_dropped` | Extra client copies dropped because the per-MAC budget was exhausted. |
+| `remote_mac_owner_gone` | LAN frames whose remembered owner was not connected (fell back to a budgeted flood). |
+| `remote_macs_evicted` | Sticky MAC bindings evicted because `maxRemoteMacs` was reached. |
 
 ## Logging
 
@@ -399,8 +425,14 @@ Notes:
 - `vxlanVni` must match on both ends. Each **client** points `peerAddress` at the server's tunnel
   IP (B is `100.64.0.2` here); the server needs no `peerAddress` and learns clients automatically.
 - The server accepts multiple clients (up to `maxClients`). Unicast is sent only to the client that
-  owns the destination MAC; broadcast, multicast and unknown-unicast traffic is flooded to all
-  clients. Set `allowClientToClient: false` to keep clients from reaching each other.
+  owns the destination MAC; broadcast and multicast are flooded to all clients. Unknown unicast is
+  flooded too, but each destination MAC gets a bounded flood budget (`maxUnknownMacFloodPps`)
+  because a flood costs one copy per client. Set `allowClientToClient: false` to keep clients from
+  reaching each other.
+- MAC bindings are sticky: a MAC learned from a client keeps pointing at that client for
+  `remoteMacAgingSeconds` even after the client goes idle, so one-way traffic to a quiet host is not
+  echoed to every client. Only when the owner is genuinely gone does the frame fall back to a
+  budgeted flood, which is also how a MAC that moved between clients is rediscovered.
 - To restrict which overlay peers may join, set `allowedClientPeers` to their tunnel IPs; otherwise
   any peer that can reach the server's VXLAN port is accepted (the NetBird/WireGuard tunnel is the
   authentication boundary).
@@ -421,6 +453,11 @@ Notes:
   bounce `wt0` several times at startup. WGL2Bridge now changes TAP settings only when they differ
   and waits for `wt0` to return, but disabling NetBird's network-change reconnect on these hosts
   removes the churn entirely.
+- If the log shows `Unknown-unicast flood budget exceeded for <mac>`, traffic for that MAC is
+  reaching the LAN side faster than `maxUnknownMacFloodPps`. Either the owning client is not
+  connected (check `client <ip> idle_s ...` in the metrics), or a sender is using a static ARP entry
+  for a host that is not on the segment. Raising the limit is safe only if you accept up to
+  `limit × clients` packets per second over the tunnel.
 
 ## License
 

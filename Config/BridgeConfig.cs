@@ -85,6 +85,24 @@ public sealed record BridgeConfig
     /// <summary>Lan/server mode: seconds of inactivity after which a client and its MACs are forgotten.</summary>
     public int ClientAgingSeconds { get; init; } = 300;
 
+    /// <summary>
+    /// Lan/server mode: seconds a MAC learned from a client keeps its binding after that client goes
+    /// idle (or disconnects). The binding outlives <see cref="ClientAgingSeconds"/> on purpose: while
+    /// it exists, frames from the LAN are sent to that one client instead of being copied to every
+    /// client. Must be >= <see cref="ClientAgingSeconds"/>.
+    /// </summary>
+    public int RemoteMacAgingSeconds { get; init; } = 3600;
+
+    /// <summary>Lan/server mode: hard cap on remembered client MACs across all clients (oldest evicted first).</summary>
+    public int MaxRemoteMacs { get; init; } = 4096;
+
+    /// <summary>
+    /// Lan/server mode: per-second flood budget for a single destination MAC that cannot be resolved
+    /// to a connected client (never seen, or its remembered owner is offline). Each flooded frame
+    /// costs one copy per connected client, so this bounds the multiplication factor. 0 = unlimited.
+    /// </summary>
+    public int MaxUnknownMacFloodPps { get; init; } = 10;
+
     /// <summary>Seconds to wait before rebinding after a tunnel or adapter failure.</summary>
     public int ReconnectDelaySeconds { get; init; } = 5;
 
@@ -194,6 +212,14 @@ public sealed record BridgeConfig
             errors.Add("'MaxClients' must be at least 1.");
         if (ClientAgingSeconds < 1)
             errors.Add("'ClientAgingSeconds' must be at least 1.");
+        if (RemoteMacAgingSeconds < 1)
+            errors.Add("'RemoteMacAgingSeconds' must be at least 1.");
+        if (RemoteMacAgingSeconds < ClientAgingSeconds)
+            errors.Add("'RemoteMacAgingSeconds' must be >= 'ClientAgingSeconds' (otherwise MAC bindings expire before the client does and unknown unicast floods return).");
+        if (MaxRemoteMacs < 1)
+            errors.Add("'MaxRemoteMacs' must be at least 1.");
+        if (MaxUnknownMacFloodPps < 0)
+            errors.Add("'MaxUnknownMacFloodPps' must be >= 0 (0 = unlimited).");
         if (VxlanVni is < 0 or > 0xFFFFFF)
             errors.Add("'VxlanVni' must be between 0 and 16777215.");
         if (VxlanDestinationPort is < 1 or > 65535)
