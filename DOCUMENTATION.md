@@ -310,13 +310,13 @@ when the overlay is not up yet, in which case the session loop resolves it later
 | `LogTapOperationalStatus()` | `void` | Enumerates the TAP NIC and logs its operational status and IPv4 addresses (warns if not `Up`). |
 | `PumpTapToTunnel(ct)` | `async Task` | The TAP → tunnel forwarding pump (see [§5](#5-data-flow-internals-two-pumps)). |
 | `PumpTunnelToTap(ct)` | `async Task` | The tunnel → TAP forwarding pump. |
-| `PumpStats(ct)` | `async Task` | Periodically logs per-direction counters; no-op if `StatsIntervalSeconds <= 0`. |
+| `PumpStats(ct)` | `async Task` | Periodically logs per-direction counters; no-op if `StatsIntervalSeconds <= 0`. In server mode it also logs each connected client at `Debug`. |
 | `PumpInterfaceWatch(ct)` | `async Task` | Liveness: checks the tunnel IP is still bindable (fails → `TunnelUnavailableException` → prompt retry). Deliberately free of CLI calls so a hung process can't stall it. |
 | `IsLocalAddressPresent(IPAddress)` | `static bool` | Binds a UDP socket to the address to test whether it is still assigned locally (`WSAEADDRNOTAVAIL` ⇒ gone). |
 | `PumpHealthCheck(ct)` | `async Task` | Secondary checks on a fixed 30 s cadence: NetBird peer connected, and a "no inbound traffic while forwarding" heuristic. |
 | `ResolvePeerBoundedAsync(ct)` | `async Task<PeerInfo?>` | Runs peer resolution off-thread with a 10 s timeout so a hung CLI/API can't stall the loop. |
 | `PumpProbes(ct)` | `async Task` | Injects `LoopDetector.BuildProbe` frames into the TAP every `loopProbeIntervalSeconds`; no-op if loop detection is disabled. |
-| `GetMetricsSnapshot()` | `string` | Returns a `text/plain` snapshot of all counters for the metrics endpoint. |
+| `GetMetricsSnapshot()` | `string` | Returns a `text/plain` snapshot of all counters for the metrics endpoint. In server mode it includes a `client <endpoint> idle_s <n> macs <n>` line per connected client. |
 | `OnLoopDetected()` | `void` | Logs a loop error; sets `_stopRequested` + cancels the session when `StopOnLoopDetected`, else warns and continues. |
 | `LogSessionFailure(Exception, ref string?, int)` | `void` | Logs a session failure, de-duplicating repeated identical messages to `Debug`. |
 | `FormatMac(ReadOnlySpan<byte>)` | `static string` | Formats a 6-byte MAC as `AA:BB:CC:DD:EE:FF`. |

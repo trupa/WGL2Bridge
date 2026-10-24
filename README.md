@@ -299,7 +299,10 @@ sc.exe delete WGL2Bridge
 ```
 
 **Metrics endpoint** — set `metricsPort` (e.g. `9080`) and browse `http://127.0.0.1:9080/`
-(text/plain counters).
+(text/plain counters). In `Lan`/server mode the body also includes one
+`client <ip>:<port> idle_s <n> macs <n>` line per connected client (or `client none`), so you can
+see who is attached. The periodic `Stats:` log also shows the client count and per-client detail at
+`Debug` level.
 
 ## Logging
 

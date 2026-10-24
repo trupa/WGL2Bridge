@@ -754,6 +754,14 @@ public sealed class Bridge : IAsyncDisposable
                       $"client-drop={Interlocked.Read(ref _clientDropped)} rejected={Interlocked.Read(ref _clientRejected)} " +
                       $"flooded={Interlocked.Read(ref _flooded)}."
                     : "."));
+
+            if (_serverMode)
+            {
+                foreach (string clientLine in BuildClientReport().Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    BridgeLog.Debug($"Server {clientLine}");
+                }
+            }
         }
     }
 
@@ -919,6 +927,7 @@ public sealed class Bridge : IAsyncDisposable
         $"client_dropped {Interlocked.Read(ref _clientDropped)}\n" +
         $"client_rejected {Interlocked.Read(ref _clientRejected)}\n" +
         $"flooded {Interlocked.Read(ref _flooded)}\n" +
+        (_serverMode ? BuildClientReport() : string.Empty) +
         $"loop_detected {(_loopDetector.LoopDetected ? 1 : 0)}\n";
 
     private void OnLoopDetected()
@@ -1022,6 +1031,27 @@ public sealed class Bridge : IAsyncDisposable
             PruneClientsLocked(Environment.TickCount64);
             return _clients.Keys.ToArray();
         }
+    }
+
+    /// <summary>Per-client report (endpoint, idle seconds, learned MAC count) for metrics/debugging.</summary>
+    private string BuildClientReport()
+    {
+        long nowMs = Environment.TickCount64;
+        var lines = new List<string>();
+
+        lock (_clientLock)
+        {
+            PruneClientsLocked(nowMs);
+
+            foreach (KeyValuePair<IPEndPoint, long> client in _clients.OrderBy(kv => kv.Key.ToString()))
+            {
+                int macs = _remoteMacs.Count(kv => kv.Value.Endpoint.Equals(client.Key));
+                long idleSeconds = Math.Max(0, (nowMs - client.Value) / 1000);
+                lines.Add($"client {client.Key} idle_s {idleSeconds} macs {macs}");
+            }
+        }
+
+        return lines.Count == 0 ? "client none\n" : string.Join('\n', lines) + "\n";
     }
 
     private void PruneClientsLocked(long nowMs)
