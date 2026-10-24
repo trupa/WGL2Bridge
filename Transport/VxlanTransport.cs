@@ -43,17 +43,20 @@ public sealed class VxlanTransport : IBridgeTransport
 
     public long DroppedNonPeer => Interlocked.Read(ref _droppedNonPeer);
     public bool IsOpen => _socket is not null;
+    public IPEndPoint? LastReceiveSource { get; private set; }
 
     /// <summary>
     /// Binds a UDP socket to the tunnel IP on the VXLAN port. The socket is intentionally NOT
     /// connected: Linux vxlan transmits from a hashed source port (not 4789), which a connected
     /// socket would filter out. Binding pins egress to the tunnel IP and demuxes inbound VXLAN.
+    /// A null peer opens server mode: packets from any source are accepted.
     /// </summary>
-    public void Open(IPAddress localTunnelIp, IPAddress peerIp)
+    public void Open(IPAddress localTunnelIp, IPAddress? peerIp)
     {
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         _socket.Bind(new IPEndPoint(localTunnelIp, _destinationPort));
-        _peer = new IPEndPoint(peerIp, _destinationPort);
+        _peer = peerIp is null ? null : new IPEndPoint(peerIp, _destinationPort);
+        LastReceiveSource = null;
         Interlocked.Exchange(ref _nonPeerLogged, 0);
     }
 
@@ -83,7 +86,15 @@ public sealed class VxlanTransport : IBridgeTransport
     }
 
     public ValueTask<int> SendAsync(ReadOnlyMemory<byte> buffer, int frameOffset, int frameLength, CancellationToken ct) =>
-        _socket!.SendToAsync(buffer[..(frameOffset + frameLength)], SocketFlags.None, _peer!, ct);
+        _socket!.SendToAsync(
+            buffer[..(frameOffset + frameLength)],
+            SocketFlags.None,
+            _peer ?? throw new InvalidOperationException("No peer configured (server mode)."),
+            ct);
+
+    public ValueTask<int> SendToAsync(
+        ReadOnlyMemory<byte> buffer, int frameOffset, int frameLength, IPEndPoint destination, CancellationToken ct) =>
+        _socket!.SendToAsync(buffer[..(frameOffset + frameLength)], SocketFlags.None, destination, ct);
 
     public async ValueTask<int> ReceiveAsync(Memory<byte> buffer, CancellationToken ct)
     {
@@ -91,13 +102,17 @@ public sealed class VxlanTransport : IBridgeTransport
             .ReceiveFromAsync(buffer, SocketFlags.None, _remote, ct)
             .ConfigureAwait(false);
 
-        IPAddress source = (result.RemoteEndPoint as IPEndPoint)?.Address ?? IPAddress.Any;
-        if (_validatePeerSource && !source.Equals(_peer!.Address))
+        IPEndPoint? source = result.RemoteEndPoint as IPEndPoint;
+        LastReceiveSource = source;
+
+        // In server mode (_peer is null) the bridge accepts multiple clients and applies the
+        // configured allow-list itself.
+        if (_peer is not null && _validatePeerSource && source is not null && !source.Address.Equals(_peer.Address))
         {
             Interlocked.Increment(ref _droppedNonPeer);
             if (Interlocked.Exchange(ref _nonPeerLogged, 1) == 0)
             {
-                BridgeLog.Warning($"Dropped tunnel packet from non-peer source {source} (expected peer {_peer.Address}).");
+                BridgeLog.Warning($"Dropped tunnel packet from non-peer source {source.Address} (expected peer {_peer.Address}).");
             }
             return 0;
         }

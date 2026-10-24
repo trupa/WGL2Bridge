@@ -96,8 +96,9 @@ public static class Program
         {
             var netbird = new NetbirdStatus(config.NetbirdCliPath, config.PeerName);
             IPeerProvider peerProvider = new PeerResolver(config, new NetbirdPeerProvider(netbird));
+            bool serverMode = config.BridgeSide == BridgeSide.Lan;
             PeerInfo? peer = peerProvider.Resolve();
-            if (peer is null)
+            if (peer is null && !serverMode)
             {
                 BridgeLog.Error("Unknown peer: no 'PeerAddress'/'PeerName' resolved and overlay discovery failed.");
                 return false;
@@ -132,7 +133,7 @@ public static class Program
                 576,
                 9000);
 
-            BridgeLog.Info($"Check OK: peer={peer.Address}, tunnel='{config.TunnelInterfaceName}' {tunnel.LocalAddress} MTU {tunnel.Mtu}, tap='{config.TapName}' MTU {tapMtu}, encap='{transport.Description}'.");
+            BridgeLog.Info($"Check OK: peer={(peer is null ? "(server: learns clients)" : peer.Address.ToString())}, tunnel='{config.TunnelInterfaceName}' {tunnel.LocalAddress} MTU {tunnel.Mtu}, tap='{config.TapName}' MTU {tapMtu}, encap='{transport.Description}'.");
             return true;
         }
         catch (Exception ex)
@@ -149,16 +150,24 @@ public static class Program
             $"Resolved config: mode={config.TransportMode}, tap='{config.TapName}', " +
             $"tunnel='{config.TunnelInterfaceName}', peer={(config.PeerAddress ?? "(discover)")}.");
 
+        bool serverMode = config.BridgeSide == BridgeSide.Lan;
         var netbird = new NetbirdStatus(config.NetbirdCliPath, config.PeerName);
 
         // The NetBird CLI is only consulted when discovery is actually required: a 'PeerName'
         // target, or no 'PeerAddress' to pin. With a pinned peer the CLI is never used, so don't
         // probe it (avoids nuisance warnings and a needless 'netbird status' subprocess).
-        bool overlayDiscoveryRequired =
-            !string.IsNullOrWhiteSpace(config.PeerName) ||
-            string.IsNullOrWhiteSpace(config.PeerAddress);
+        bool overlayDiscoveryRequired = !serverMode &&
+            (!string.IsNullOrWhiteSpace(config.PeerName) || string.IsNullOrWhiteSpace(config.PeerAddress));
 
-        if (overlayDiscoveryRequired)
+        if (serverMode)
+        {
+            BridgeLog.Info(
+                "Bridge side is 'Lan': accepting multiple clients on the tunnel" +
+                (string.IsNullOrWhiteSpace(config.PeerAddress) && string.IsNullOrWhiteSpace(config.PeerName)
+                    ? " (learned from inbound traffic)."
+                    : $"; '{config.PeerAddress ?? config.PeerName}' is used as the initial client."));
+        }
+        else if (overlayDiscoveryRequired)
         {
             if (!netbird.CliAvailable)
             {
@@ -191,20 +200,39 @@ public static class Program
 
         if (peer is null)
         {
-            string target = !string.IsNullOrWhiteSpace(config.PeerName)
-                ? $"peer '{config.PeerName}'"
-                : !string.IsNullOrWhiteSpace(config.PeerAddress)
-                    ? $"peer address '{config.PeerAddress}'"
-                    : "peer (no 'PeerName' or 'PeerAddress' configured)";
+            if (serverMode)
+            {
+                BridgeLog.Info("LAN/server mode: no peer configured; waiting for clients to appear.");
+            }
+            else
+            {
+                string target = !string.IsNullOrWhiteSpace(config.PeerName)
+                    ? $"peer '{config.PeerName}'"
+                    : !string.IsNullOrWhiteSpace(config.PeerAddress)
+                        ? $"peer address '{config.PeerAddress}'"
+                        : "peer (no 'PeerName' or 'PeerAddress' configured)";
 
-            BridgeLog.Warning($"Configured {target} is not available; waiting and retrying (no fallback to another peer).");
+                BridgeLog.Warning($"Configured {target} is not available; waiting and retrying (no fallback to another peer).");
+            }
         }
         else
         {
             BridgeLog.Debug($"Peer resolved to '{peer.Address}' (connected={peer.Connected}).");
         }
 
-        if (!config.PeerSourceValidation)
+        if (serverMode)
+        {
+            if (config.AllowedClientPeers.Length == 0)
+            {
+                BridgeLog.Warning("Lan/server mode: 'allowedClientPeers' is empty; any peer that can reach the tunnel may join.");
+            }
+
+            if (!config.AllowClientToClient)
+            {
+                BridgeLog.Info("Lan/server mode: client-to-client forwarding is disabled.");
+            }
+        }
+        else if (!config.PeerSourceValidation)
         {
             BridgeLog.Warning("Peer source validation is DISABLED: inbound tunnel packets are accepted from any source.");
         }

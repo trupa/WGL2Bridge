@@ -237,8 +237,8 @@ Counters use `Interlocked` on `long` fields (no locks) and are read atomically f
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
 | `Main(string[] args)` | `static async Task<int>` | Parses args, loads & validates config, initializes logging, dispatches to check/service/console modes. Returns process exit code (`0` ok, `1` fatal/misconfig). Never retries config errors. |
-| `RunCheck(BridgeConfig)` | `static bool` | Dry-run: resolves peer/tunnel/TAP and computes MTU without opening devices. Returns `true` if the configuration resolves. Uses the real transport object (constructing it opens no socket) so the reported MTU matches runtime. |
-| `RunBridge(BridgeConfig, CancellationToken)` | `static async Task` | Resolves runtime state, creates the adapter if needed, applies networking config (address + route isolation only when `bridgeSide` is `Client`), runs the `Bridge` plus the optional metrics endpoint. |
+| `RunCheck(BridgeConfig)` | `static bool` | Dry-run: resolves peer/tunnel/TAP and computes MTU without opening devices. A null peer is accepted in Lan/server mode. Returns `true` if the configuration resolves. Uses the real transport object (constructing it opens no socket) so the reported MTU matches runtime. |
+| `RunBridge(BridgeConfig, CancellationToken)` | `static async Task` | Resolves runtime state, creates the adapter if needed, applies networking config (address + route isolation only when `bridgeSide` is `Client`), runs the `Bridge` plus the optional metrics endpoint. In Lan mode no peer is required; the bridge learns clients. |
 | `LoadConfig(string path)` | `static BridgeConfig` | Reads a JSON file and deserializes via `ConfigJsonContext.Default.BridgeConfig`. |
 
 Behavioural notes:
@@ -325,8 +325,28 @@ when the overlay is not up yet, in which case the session loop resolves it later
 Private counters (all `long`, updated with `Interlocked`): `_tapFramesRead`, `_tapFilterDropped`,
 `_tapMacSuppressed`, `_tapForwarded`, `_tunnelPacketsReceived`, `_tunnelInvalid`,
 `_tunnelFilterDropped`, `_tunnelMacSuppressed`, `_tunnelWritten`, `_broadcastDropped`,
-`_lastTapForwardMs`, `_lastTunnelReceiveMs`. One-shot log flags: `_firstTapFrameLogged`,
+`_clientForwarded`, `_clientDropped`, `_clientRejected`, `_flooded`, `_lastTapForwardMs`,
+`_lastTunnelReceiveMs`. One-shot log flags: `_firstTapFrameLogged`,
 `_firstTunnelPacketLogged`, `_tapMacReflectedLogged`.
+
+#### Server (Lan) mode
+
+When `bridgeSide` is `Lan`, the bridge acts as a **multi-client server**:
+
+- Opens the transport with **no fixed peer**; inbound packets from any source are accepted
+  (optionally restricted by `allowedClientPeers`).
+- Learns each client's `IPEndPoint` from inbound traffic and maintains a `MAC → client` table
+  (`_remoteMacs`), alongside the existing `MacTable` for LAN-vs-tunnel classification.
+- **TAP → tunnel:** broadcast/multicast and unknown unicast are flooded to all clients; a known
+  remote MAC is sent only to its owning client; a known LAN MAC is left to the Windows bridge.
+- **Tunnel → TAP:** broadcast/multicast is written to the LAN and (optionally) flooded to other
+  clients; known LAN unicast is written to the TAP; known remote unicast is forwarded directly to
+  that client; unknown unicast is written to the LAN and flooded to other clients.
+- Clients idle longer than `clientAgingSeconds` are forgotten (with their MACs); at most
+  `maxClients` are tracked.
+- `allowClientToClient: false` keeps client-originated traffic on the LAN and never forwards it to
+  another client.
+- Counters: `clients`, `client_forwarded`, `client_dropped`, `client_rejected`, `flooded`.
 
 ---
 
@@ -686,11 +706,13 @@ buffer headroom, and validate inbound packets. Egress is pinned by binding to th
 | `Description` | `string` (get) | Human-readable summary for logs. |
 | `IsOpen` | `bool` (get) | True while the socket is open. |
 | `DroppedNonPeer` | `long` (get) | Count of inbound packets dropped due to non-peer source. |
-| `Open(localTunnelIp, peerIp)` | `void` | Opens/binds the socket to the tunnel IP, targeting the peer. |
+| `LastReceiveSource` | `IPEndPoint?` (get) | Source endpoint of the last packet returned by `ReceiveAsync` (server mode). |
+| `Open(localTunnelIp, peerIp?)` | `void` | Opens/binds the socket to the tunnel IP. A null peer opens server mode (accept any source). |
 | `WriteHeader(headroom)` | `void` | Writes the constant header into reserved headroom (once per buffer). |
 | `ValidateIncoming(packet)` | `int` | Validates an inbound packet; returns the inner-frame offset or `-1`. |
-| `SendAsync(buffer, frameOffset, frameLength, ct)` | `ValueTask<int>` | Sends header+frame across the tunnel. |
-| `ReceiveAsync(buffer, ct)` | `ValueTask<int>` | Receives one packet; returns its length. |
+| `SendAsync(buffer, frameOffset, frameLength, ct)` | `ValueTask<int>` | Sends header+frame to the configured peer (client mode). |
+| `SendToAsync(buffer, frameOffset, frameLength, destination, ct)` | `ValueTask<int>` | Sends header+frame to an explicit endpoint (server mode / per-client or flood). |
+| `ReceiveAsync(buffer, ct)` | `ValueTask<int>` | Receives one packet; returns its length and records `LastReceiveSource`. |
 | `Close()` | `void` | Closes the socket. |
 
 #### `VxlanTransport` (`Transport/VxlanTransport.cs`)
@@ -707,11 +729,13 @@ interface (dstport 4789).
 | `EncapsulationOverhead` | `int` = 36 | IP(20) + UDP(8) + VXLAN(8). |
 | `Description` | `string` | `VXLAN (VNI <n>, UDP/<port>)`. |
 | `DroppedNonPeer` / `IsOpen` | `long` / `bool` | Counters/state. |
-| `Open(localTunnelIp, peerIp)` | `void` | Binds UDP to the tunnel IP on the VXLAN port. **Intentionally not connected**, because Linux vxlan transmits from a hashed source port (not 4789) which a connected socket would filter out. |
+| `LastReceiveSource` | `IPEndPoint?` (get) | Source endpoint of the last received packet (used to learn clients). |
+| `Open(localTunnelIp, peerIp?)` | `void` | Binds UDP to the tunnel IP on the VXLAN port. **Intentionally not connected**, because Linux vxlan transmits from a hashed source port (not 4789) which a connected socket would filter out. A null peer opens server mode. |
 | `WriteHeader(headroom)` | `void` | Sets the VXLAN "I" flag and 24-bit VNI into the 8-byte header. |
 | `ValidateIncoming(packet)` | `int` | Checks the "I" flag and VNI; returns `8` on match else `-1`. |
-| `SendAsync(...)` | `ValueTask<int>` | `SendToAsync` with the header+frame slice (the buffer already contains the header written earlier). |
-| `ReceiveAsync(buffer, ct)` | `async ValueTask<int>` | `ReceiveFromAsync`; enforces `PeerSourceValidation` (drops non-peer sources, logging once). |
+| `SendAsync(...)` | `ValueTask<int>` | Sends the header+frame slice to the configured peer (client mode). |
+| `SendToAsync(..., destination, ct)` | `ValueTask<int>` | Sends the header+frame slice to an explicit client endpoint (server mode / flood). |
+| `ReceiveAsync(buffer, ct)` | `async ValueTask<int>` | `ReceiveFromAsync`; records `LastReceiveSource`; in client mode enforces `PeerSourceValidation`. |
 | `Close()` / `Dispose()` | `void` | Disposes the socket. |
 
 #### `RawTransport` (`Transport/RawTransport.cs`)
@@ -727,11 +751,13 @@ must run matching software.
 | `HeaderLength` | `int` = 0 | No headroom. |
 | `EncapsulationOverhead` | `int` = 20 | IP header only. |
 | `Description` | `string` | `Raw IP (protocol <n>)`. |
-| `Open(localTunnelIp, peerIp)` | `void` | Opens a `SocketType.Raw` socket for the protocol and binds to the tunnel IP. |
+| `LastReceiveSource` | `IPEndPoint?` (get) | Source endpoint of the last received packet. |
+| `Open(localTunnelIp, peerIp?)` | `void` | Opens a `SocketType.Raw` socket for the protocol and binds to the tunnel IP. A null peer opens server mode. |
 | `WriteHeader(headroom)` | `void` | No-op. |
 | `ValidateIncoming(packet)` | `int` | Verifies IPv4, valid IHL, and the configured protocol; returns the IHL (L3 payload offset) or `-1`. |
-| `SendAsync(...)` | `ValueTask<int>` | `SendToAsync` of the frame slice. |
-| `ReceiveAsync(buffer, ct)` | `async ValueTask<int>` | `ReceiveFromAsync`; enforces `PeerSourceValidation`. |
+| `SendAsync(...)` | `ValueTask<int>` | Sends the frame slice to the configured peer (client mode). |
+| `SendToAsync(..., destination, ct)` | `ValueTask<int>` | Sends the frame slice to an explicit client endpoint (server mode / flood). |
+| `ReceiveAsync(buffer, ct)` | `async ValueTask<int>` | `ReceiveFromAsync`; records `LastReceiveSource`; in client mode enforces `PeerSourceValidation`. |
 | `Close()` / `Dispose()` | `void` | Disposes the socket. |
 
 #### `TransportFactory` (`Transport/TransportFactory.cs`)
@@ -758,6 +784,10 @@ must run matching software.
 | `vxlanDestinationPort` | int | `4789` | VXLAN UDP destination port. |
 | `rawIpProtocol` | int | `99` | IPv4 protocol number for Raw mode (1..255). |
 | `peerSourceValidation` | bool | `true` | Drop inbound packets whose source is not the peer. |
+| `allowedClientPeers` | string[] | `[]` | Lan/server mode: optional allow-list of client tunnel IPs; empty accepts any overlay peer. |
+| `allowClientToClient` | bool | `true` | Lan/server mode: allow clients to reach each other through the server. |
+| `maxClients` | int | `64` | Lan/server mode: maximum tracked clients. |
+| `clientAgingSeconds` | int | `300` | Lan/server mode: idle timeout before a client and its MACs are forgotten. |
 | `reconnectDelaySeconds` | int | `5` | Delay before rebinding after a recoverable failure. |
 | `tunnelHealthCheckSeconds` | int | `30` | Cadence of tunnel-interface reachability checks; 0 disables. |
 | `stopOnLoopDetected` | bool | `true` | Exit when our own loop probe returns. |

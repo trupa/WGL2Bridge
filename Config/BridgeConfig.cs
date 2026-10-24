@@ -1,3 +1,4 @@
+using System.Net;
 using WGL2Bridge.Logging;
 using WGL2Bridge.Network;
 using WGL2Bridge.Platform;
@@ -68,6 +69,21 @@ public sealed record BridgeConfig
 
     /// <summary>Drop inbound tunnel packets whose source IP is not the peer. Disable only for diagnostics or multi-peer topologies.</summary>
     public bool PeerSourceValidation { get; init; } = true;
+
+    /// <summary>
+    /// Lan/server mode only: optional allow-list of client tunnel IPv4 addresses. When empty the
+    /// server accepts any peer that can reach the tunnel (NetBird/WireGuard authenticates the peer).
+    /// </summary>
+    public string[] AllowedClientPeers { get; init; } = [];
+
+    /// <summary>Lan/server mode: allow remote clients to reach each other through the server.</summary>
+    public bool AllowClientToClient { get; init; } = true;
+
+    /// <summary>Lan/server mode: maximum number of simultaneously tracked clients.</summary>
+    public int MaxClients { get; init; } = 64;
+
+    /// <summary>Lan/server mode: seconds of inactivity after which a client and its MACs are forgotten.</summary>
+    public int ClientAgingSeconds { get; init; } = 300;
 
     /// <summary>Seconds to wait before rebinding after a tunnel or adapter failure.</summary>
     public int ReconnectDelaySeconds { get; init; } = 5;
@@ -169,6 +185,15 @@ public sealed record BridgeConfig
             errors.Add($"'TransportMode' value '{TransportMode}' is not a valid mode.");
         if (!Enum.IsDefined(BridgeSide))
             errors.Add($"'BridgeSide' value '{BridgeSide}' is not a valid side.");
+        foreach (string peer in AllowedClientPeers)
+        {
+            if (!IPAddress.TryParse(peer, out _))
+                errors.Add($"'AllowedClientPeers' contains invalid IP address '{peer}'.");
+        }
+        if (MaxClients < 1)
+            errors.Add("'MaxClients' must be at least 1.");
+        if (ClientAgingSeconds < 1)
+            errors.Add("'ClientAgingSeconds' must be at least 1.");
         if (VxlanVni is < 0 or > 0xFFFFFF)
             errors.Add("'VxlanVni' must be between 0 and 16777215.");
         if (VxlanDestinationPort is < 1 or > 65535)

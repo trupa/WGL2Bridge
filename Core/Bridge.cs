@@ -58,6 +58,28 @@ public sealed class Bridge : IAsyncDisposable
     private bool _tunnelUnavailableLogged;
     private int _lastAppliedMtu = -1;
 
+    // Server (Lan) mode: clients are learned from inbound tunnel packets.
+    private readonly bool _serverMode;
+    private readonly bool _allowClientToClient;
+    private readonly int _maxClients;
+    private readonly long _clientAgingMs;
+    private readonly long _macAgingMs;
+    private readonly HashSet<IPAddress>? _allowedClientPeers;
+    private readonly object _clientLock = new();
+    private readonly Dictionary<IPEndPoint, long> _clients = new();
+    private readonly Dictionary<ulong, RemoteMac> _remoteMacs = new();
+    private long _lastClientPruneMs;
+    private long _clientForwarded;
+    private long _clientDropped;
+    private long _clientRejected;
+    private long _flooded;
+
+    private struct RemoteMac
+    {
+        public IPEndPoint Endpoint;
+        public long LastSeenMs;
+    }
+
     private CancellationTokenSource? _sessionCts;
     private volatile bool _stopRequested;
 
@@ -74,6 +96,17 @@ public sealed class Bridge : IAsyncDisposable
         _config = config;
         _peerAddress = peerAddress;
         _peerProvider = peerProvider;
+        _serverMode = config.BridgeSide == BridgeSide.Lan;
+        _allowClientToClient = config.AllowClientToClient;
+        _maxClients = config.MaxClients;
+        _clientAgingMs = config.ClientAgingSeconds * 1000L;
+        _macAgingMs = config.MacAgingSeconds * 1000L;
+        if (config.AllowedClientPeers.Length > 0)
+        {
+            _allowedClientPeers = new HashSet<IPAddress>(
+                config.AllowedClientPeers.Select(IPAddress.Parse));
+        }
+
         _tap = new TapAdapter(tapDevicePath);
         _networkConfigurator = new TapNetworkConfigurator(config, tapAdapterId);
         _transport = TransportFactory.Create(config);
@@ -288,12 +321,19 @@ public sealed class Bridge : IAsyncDisposable
     {
         _tunnel.Resolve(_config);
 
-        // The peer is resolved here (not only at process start) so a tunnel/overlay that is not
-        // up yet — e.g. NetBird starting after this service — is a recoverable condition that is
-        // retried, rather than an immediate process exit.
-        RefreshPeer();
-        IPAddress peerAddress = _peerAddress
-            ?? throw new IOException("Peer is not resolved yet; waiting for the overlay to become available.");
+        // Client mode requires a resolved peer. Lan/server mode learns clients from inbound
+        // traffic, so a peer is optional (it is only used as a seed client).
+        if (!_serverMode)
+        {
+            // Resolved per session so an overlay that is not up yet is retried rather than fatal.
+            RefreshPeer();
+        }
+
+        IPAddress? peerAddress = _peerAddress;
+        if (!_serverMode && peerAddress is null)
+        {
+            throw new IOException("Peer is not resolved yet; waiting for the overlay to become available.");
+        }
 
         IPAddress localIp = _tunnel.LocalAddress!;
         int tunnelMtu = _tunnel.Mtu;
@@ -328,7 +368,12 @@ public sealed class Bridge : IAsyncDisposable
 
         BridgeLog.Info($"TAP MTU {tapMtu} (tunnel MTU {tunnelMtu} - {_transport.EncapsulationOverhead} encapsulation - {innerHeader} Ethernet header).");
 
-        _transport.Open(localIp, peerAddress);
+        if (_serverMode && peerAddress is not null)
+        {
+            SeedClient(peerAddress);
+        }
+
+        _transport.Open(localIp, _serverMode ? null : peerAddress);
         BridgeLog.Info($"Encapsulation active: {_transport.Description}; egress pinned to tunnel address '{localIp}'.");
     }
 
@@ -445,6 +490,46 @@ public sealed class Bridge : IAsyncDisposable
                         OnLoopDetected();
                     }
 
+                    if (_serverMode)
+                    {
+                        // Multi-client forwarding: known local unicast stays on the LAN, known
+                        // remote unicast goes to its owning client, everything else floods.
+                        if (Ethernet.IsMulticast(frame))
+                        {
+                            if (!_broadcastTap.Allow(nowMs))
+                            {
+                                Interlocked.Increment(ref _broadcastDropped);
+                                continue;
+                            }
+
+                            await FloodToClientsAsync(buffer, headroom, frameLength, except: null, ct).ConfigureAwait(false);
+                            Interlocked.Increment(ref _tapForwarded);
+                            Interlocked.Exchange(ref _lastTapForwardMs, nowMs);
+                            continue;
+                        }
+
+                        if (_macTable.Resolve(frame[..6], nowMs) == MacTable.Port.Tap)
+                        {
+                            // Destination is local to the LAN; the Windows bridge handles it.
+                            Interlocked.Increment(ref _tapMacSuppressed);
+                            continue;
+                        }
+
+                        IPEndPoint? client = ResolveRemote(Ethernet.ReadMac(frame[..6]), nowMs);
+                        if (client is not null)
+                        {
+                            await _transport.SendToAsync(buffer, headroom, frameLength, client, ct).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await FloodToClientsAsync(buffer, headroom, frameLength, except: null, ct).ConfigureAwait(false);
+                        }
+
+                        Interlocked.Increment(ref _tapForwarded);
+                        Interlocked.Exchange(ref _lastTapForwardMs, nowMs);
+                        continue;
+                    }
+
                     if (!_macTable.ShouldForward(frame[..6], MacTable.Port.Tap, nowMs))
                     {
                         Interlocked.Increment(ref _tapMacSuppressed);
@@ -504,6 +589,106 @@ public sealed class Bridge : IAsyncDisposable
                 }
 
                 long nowMs = Environment.TickCount64;
+
+                if (_serverMode)
+                {
+                    IPEndPoint? source = _transport.LastReceiveSource;
+                    if (source is null || !IsClientAllowed(source.Address))
+                    {
+                        Interlocked.Increment(ref _clientRejected);
+                        continue;
+                    }
+
+                    TouchClient(source, nowMs);
+
+                    if (frame.Length >= Ethernet.HeaderLength)
+                    {
+                        ulong srcMac = Ethernet.ReadMac(frame[6..12]);
+                        if (!frame[6..12].SequenceEqual(_tap.MacAddress))
+                        {
+                            _macTable.Learn(frame[6..12], MacTable.Port.Tunnel, nowMs);
+                            if (!Ethernet.IsMulticast(srcMac))
+                            {
+                                LearnRemoteMac(srcMac, source, nowMs);
+                            }
+                        }
+                        else if (Interlocked.Exchange(ref _tapMacReflectedLogged, 1) == 0)
+                        {
+                            BridgeLog.Warning(
+                                "Own TAP MAC observed arriving from the tunnel (reflection/loop or duplicate MAC on a client); not learning it as remote.");
+                        }
+
+                        if (_loopDetector.Observe(frame))
+                        {
+                            OnLoopDetected();
+                        }
+
+                        if (Ethernet.IsMulticast(frame))
+                        {
+                            if (!_broadcastTunnel.Allow(nowMs))
+                            {
+                                Interlocked.Increment(ref _broadcastDropped);
+                                continue;
+                            }
+
+                            // The LAN always sees the broadcast; other clients see it only when
+                            // client-to-client forwarding is enabled.
+                            await _tap.WriteAsync(buffer, frameOffset, packetLength - frameOffset, ct).ConfigureAwait(false);
+                            Interlocked.Increment(ref _tunnelWritten);
+
+                            if (_allowClientToClient)
+                            {
+                                await FloodToClientsAsync(buffer, frameOffset, packetLength - frameOffset, except: source, ct).ConfigureAwait(false);
+                            }
+
+                            continue;
+                        }
+
+                        ulong destMac = Ethernet.ReadMac(frame[..6]);
+                        if (_macTable.Resolve(frame[..6], nowMs) == MacTable.Port.Tap)
+                        {
+                            // Destination is on the LAN (or the server itself).
+                            await _tap.WriteAsync(buffer, frameOffset, packetLength - frameOffset, ct).ConfigureAwait(false);
+                            Interlocked.Increment(ref _tunnelWritten);
+                            continue;
+                        }
+
+                        IPEndPoint? destClient = ResolveRemote(destMac, nowMs);
+                        if (destClient is not null && !destClient.Equals(source))
+                        {
+                            if (_allowClientToClient)
+                            {
+                                EnsureClientHeader(buffer, frameOffset);
+                                await _transport.SendToAsync(buffer, frameOffset, packetLength - frameOffset, destClient, ct).ConfigureAwait(false);
+                                Interlocked.Increment(ref _clientForwarded);
+                            }
+                            else
+                            {
+                                Interlocked.Increment(ref _clientDropped);
+                            }
+
+                            continue;
+                        }
+
+                        // Unknown destination: let the LAN see it (it may answer) and flood the
+                        // remaining clients so a newly seen MAC can be reached.
+                        await _tap.WriteAsync(buffer, frameOffset, packetLength - frameOffset, ct).ConfigureAwait(false);
+                        Interlocked.Increment(ref _tunnelWritten);
+
+                        if (_allowClientToClient)
+                        {
+                            await FloodToClientsAsync(buffer, frameOffset, packetLength - frameOffset, except: source, ct).ConfigureAwait(false);
+                        }
+
+                        continue;
+                    }
+
+                    // Truncated frame (filter fails open): write it to the LAN.
+                    await _tap.WriteAsync(buffer, frameOffset, packetLength - frameOffset, ct).ConfigureAwait(false);
+                    Interlocked.Increment(ref _tunnelWritten);
+                    continue;
+                }
+
                 if (frame.Length >= Ethernet.HeaderLength)
                 {
                     if (!frame[6..12].SequenceEqual(_tap.MacAddress))
@@ -563,7 +748,12 @@ public sealed class Bridge : IAsyncDisposable
                 $"tunnel→tap received={Interlocked.Read(ref _tunnelPacketsReceived)} written={Interlocked.Read(ref _tunnelWritten)} " +
                 $"invalid={Interlocked.Read(ref _tunnelInvalid)} filter-drop={Interlocked.Read(ref _tunnelFilterDropped)} " +
                 $"mac-suppress={Interlocked.Read(ref _tunnelMacSuppressed)}; " +
-                $"storm-drop={Interlocked.Read(ref _broadcastDropped)} non-peer-drop={_transport.DroppedNonPeer}.");
+                $"storm-drop={Interlocked.Read(ref _broadcastDropped)} non-peer-drop={_transport.DroppedNonPeer}" +
+                (_serverMode
+                    ? $" clients={SnapshotClients().Length} client-forward={Interlocked.Read(ref _clientForwarded)} " +
+                      $"client-drop={Interlocked.Read(ref _clientDropped)} rejected={Interlocked.Read(ref _clientRejected)} " +
+                      $"flooded={Interlocked.Read(ref _flooded)}."
+                    : "."));
         }
     }
 
@@ -638,22 +828,28 @@ public sealed class Bridge : IAsyncDisposable
         {
             await Task.Delay(interval, ct).ConfigureAwait(false);
 
-            PeerInfo? peer = await ResolvePeerBoundedAsync(ct).ConfigureAwait(false);
-
-            BridgeLog.Debug(
-                $"HealthCheck: peer={(peer is null ? "null" : peer.Address.ToString())} connected={peer?.Connected}.");
-
-            if (peer is { Connected: false })
+            if (!_serverMode)
             {
-                string peerLabel = string.IsNullOrWhiteSpace(_config.PeerName) ? peer.Address.ToString() : _config.PeerName;
-                throw new IOException($"NetBird reports peer '{peerLabel}' is not connected.");
+                PeerInfo? peer = await ResolvePeerBoundedAsync(ct).ConfigureAwait(false);
+
+                BridgeLog.Debug(
+                    $"HealthCheck: peer={(peer is null ? "null" : peer.Address.ToString())} connected={peer?.Connected}.");
+
+                if (peer is { Connected: false })
+                {
+                    string peerLabel = string.IsNullOrWhiteSpace(_config.PeerName) ? peer.Address.ToString() : _config.PeerName;
+                    throw new IOException($"NetBird reports peer '{peerLabel}' is not connected.");
+                }
             }
 
             long nowMs = Environment.TickCount64;
             long lastSent = Interlocked.Read(ref _lastTapForwardMs);
             long lastReceived = Interlocked.Read(ref _lastTunnelReceiveMs);
 
-            if (lastSent > 0 && nowMs - lastSent <= intervalMs && nowMs - lastReceived > intervalMs)
+            // In server mode there may legitimately be no clients (and therefore no inbound
+            // traffic) while LAN broadcasts are still being forwarded, so this heuristic does
+            // not apply.
+            if (!_serverMode && lastSent > 0 && nowMs - lastSent <= intervalMs && nowMs - lastReceived > intervalMs)
             {
                 throw new IOException($"Tunnel health check failed: no inbound traffic for {peerCheckSeconds}s while frames were being forwarded.");
             }
@@ -705,7 +901,7 @@ public sealed class Bridge : IAsyncDisposable
 
     /// <summary>Returns a plain-text snapshot of the bridge counters for the metrics endpoint.</summary>
     public string GetMetricsSnapshot() =>
-        $"peer {(_peerAddress?.ToString() ?? "(unresolved)")}\n" +
+        $"peer {(_serverMode ? $"server ({SnapshotClients().Length} clients)" : (_peerAddress?.ToString() ?? "(unresolved)"))}\n" +
         $"transport {_transport.Mode}\n" +
         $"tap_read {Interlocked.Read(ref _tapFramesRead)}\n" +
         $"tap_forwarded {Interlocked.Read(ref _tapForwarded)}\n" +
@@ -718,6 +914,11 @@ public sealed class Bridge : IAsyncDisposable
         $"tunnel_filter_dropped {Interlocked.Read(ref _tunnelFilterDropped)}\n" +
         $"tunnel_mac_suppressed {Interlocked.Read(ref _tunnelMacSuppressed)}\n" +
         $"tunnel_non_peer_dropped {_transport.DroppedNonPeer}\n" +
+        $"clients {(_serverMode ? SnapshotClients().Length : 0)}\n" +
+        $"client_forwarded {Interlocked.Read(ref _clientForwarded)}\n" +
+        $"client_dropped {Interlocked.Read(ref _clientDropped)}\n" +
+        $"client_rejected {Interlocked.Read(ref _clientRejected)}\n" +
+        $"flooded {Interlocked.Read(ref _flooded)}\n" +
         $"loop_detected {(_loopDetector.LoopDetected ? 1 : 0)}\n";
 
     private void OnLoopDetected()
@@ -752,6 +953,128 @@ public sealed class Bridge : IAsyncDisposable
     private static string FormatMac(ReadOnlySpan<byte> mac) =>
         string.Join(':', mac[0].ToString("X2"), mac[1].ToString("X2"), mac[2].ToString("X2"),
             mac[3].ToString("X2"), mac[4].ToString("X2"), mac[5].ToString("X2"));
+
+    // ---- Server (Lan) mode: learned clients and per-client MAC forwarding ----
+
+    private void SeedClient(IPAddress address)
+    {
+        int port = _transport.Mode == TransportMode.Vxlan ? _config.VxlanDestinationPort : 0;
+        TouchClient(new IPEndPoint(address, port), Environment.TickCount64);
+        BridgeLog.Debug($"Server mode: seeded client '{address}'.");
+    }
+
+    private bool IsClientAllowed(IPAddress address) =>
+        _allowedClientPeers is null || _allowedClientPeers.Contains(address);
+
+    private void TouchClient(IPEndPoint endpoint, long nowMs)
+    {
+        lock (_clientLock)
+        {
+            _clients[endpoint] = nowMs;
+
+            if (_clients.Count > _maxClients)
+            {
+                IPEndPoint oldest = _clients.OrderBy(kv => kv.Value).First().Key;
+                _clients.Remove(oldest);
+                RemoveMacsFor(oldest);
+                BridgeLog.Warning($"Client limit {_maxClients} reached; evicted '{oldest}'.");
+            }
+
+            if (nowMs - _lastClientPruneMs >= 30_000)
+            {
+                PruneClientsLocked(nowMs);
+                _lastClientPruneMs = nowMs;
+            }
+        }
+    }
+
+    private void LearnRemoteMac(ulong mac, IPEndPoint endpoint, long nowMs)
+    {
+        lock (_clientLock)
+        {
+            _remoteMacs[mac] = new RemoteMac { Endpoint = endpoint, LastSeenMs = nowMs };
+        }
+    }
+
+    private IPEndPoint? ResolveRemote(ulong mac, long nowMs)
+    {
+        lock (_clientLock)
+        {
+            if (!_remoteMacs.TryGetValue(mac, out RemoteMac entry))
+            {
+                return null;
+            }
+
+            if (nowMs - entry.LastSeenMs > _macAgingMs)
+            {
+                _remoteMacs.Remove(mac);
+                return null;
+            }
+
+            return entry.Endpoint;
+        }
+    }
+
+    private IPEndPoint[] SnapshotClients()
+    {
+        lock (_clientLock)
+        {
+            PruneClientsLocked(Environment.TickCount64);
+            return _clients.Keys.ToArray();
+        }
+    }
+
+    private void PruneClientsLocked(long nowMs)
+    {
+        List<IPEndPoint> expired = _clients
+            .Where(kv => nowMs - kv.Value > _clientAgingMs)
+            .Select(kv => kv.Key)
+            .ToList();
+
+        foreach (IPEndPoint endpoint in expired)
+        {
+            _clients.Remove(endpoint);
+            RemoveMacsFor(endpoint);
+        }
+    }
+
+    private void RemoveMacsFor(IPEndPoint endpoint)
+    {
+        List<ulong> macs = _remoteMacs
+            .Where(kv => kv.Value.Endpoint.Equals(endpoint))
+            .Select(kv => kv.Key)
+            .ToList();
+
+        foreach (ulong mac in macs)
+        {
+            _remoteMacs.Remove(mac);
+        }
+    }
+
+    private async Task FloodToClientsAsync(byte[] buffer, int frameOffset, int frameLength, IPEndPoint? except, CancellationToken ct)
+    {
+        EnsureClientHeader(buffer, frameOffset);
+
+        foreach (IPEndPoint client in SnapshotClients())
+        {
+            if (except is not null && client.Equals(except))
+            {
+                continue;
+            }
+
+            await _transport.SendToAsync(buffer, frameOffset, frameLength, client, ct).ConfigureAwait(false);
+            Interlocked.Increment(ref _flooded);
+        }
+    }
+
+    private void EnsureClientHeader(byte[] buffer, int frameOffset)
+    {
+        int headerLength = _transport.HeaderLength;
+        if (headerLength > 0)
+        {
+            _transport.WriteHeader(buffer.AsSpan(frameOffset - headerLength, headerLength));
+        }
+    }
 
     public ValueTask DisposeAsync()
     {

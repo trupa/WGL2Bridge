@@ -94,9 +94,11 @@ every notable configuration key, the expected type, and how the bridge uses the 
   - Which side of the connection this instance is on. `Client` treats the TAP as a standalone
     adapter: WGL2Bridge configures its IPv4 address (DHCP, or `tapIpAddress` when set), applies
     route isolation and renews DHCP after a reconnect. `Lan` treats the TAP as a port of a Windows
-    network bridge: WGL2Bridge does **not** configure an address, route isolation or MTU on the
-    TAP and never runs DHCP on it — the bridge (or the underlying physical NIC) owns the LAN
-    address and MTU. Use `Lan` on the machine whose TAP is bridged to its physical NIC.
+    network bridge and acts as a **multi-client server**: it learns clients from inbound tunnel
+    traffic and forwards frames per destination MAC. It does **not** configure an address, route
+    isolation or MTU on the TAP and never runs DHCP on it — the bridge (or the underlying physical
+    NIC) owns the LAN address and MTU. Use `Lan` on the machine whose TAP is bridged to its
+    physical NIC.
 
 - tunnelInterfaceName (string, default: "NetBird")
   - The friendly name of the WireGuard/NetBird tunnel interface on the host. The encapsulation socket
@@ -112,7 +114,8 @@ every notable configuration key, the expected type, and how the bridge uses the 
   - The IP address (or hostname) of the remote peer to which encapsulated frames are sent. This value
     is used as a fallback when name-based discovery (see `peerName`) is not configured or fails to
     resolve. If `peerName` is set and discovery succeeds, the discovered peer IP takes precedence over
-    `peerAddress`.
+    `peerAddress`. In `Lan`/server mode it is optional: the server learns clients from inbound
+    traffic, and a configured address is only used as the initial client (seed).
 
 - peerName (string|null, default: null)
   - NetBird peer FQDN used during CLI discovery. When set, the bridge accepts **only** a peer whose
@@ -144,7 +147,19 @@ WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and leave `pee
   - IPv4 protocol number used for `Raw` transport. The peer must be configured to receive raw IP packets of this protocol number and inject the payload as Ethernet frames.
 
 - peerSourceValidation (boolean, default: true)
-  - When true the bridge drops inbound tunnel packets that do not appear to originate from the configured `peerAddress` or discovered NetBird peer. Disable only for diagnostics or when multiple peers legitimately send traffic.
+  - Client mode: drops inbound tunnel packets that do not originate from the configured `peerAddress` or discovered NetBird peer. Ignored in `Lan` mode, where `allowedClientPeers` controls access.
+
+- allowedClientPeers (array of strings, default: [])
+  - Lan/server mode only. Optional allow-list of client tunnel IPv4 addresses. When empty, the server accepts any peer that can reach the tunnel (NetBird/WireGuard authenticates the peer).
+
+- allowClientToClient (boolean, default: true)
+  - Lan/server mode. When true, remote clients can reach each other through the server (standard L2 bridge). When false, client-originated traffic is only written to the LAN, never forwarded to other clients.
+
+- maxClients (integer, default: 64)
+  - Lan/server mode. Maximum number of clients tracked at once; the least-recently-seen client is evicted when exceeded.
+
+- clientAgingSeconds (integer, default: 300)
+  - Lan/server mode. Idle timeout after which a client and its learned MACs are forgotten.
 
 - reconnectDelaySeconds (integer, default: 5)
   - Delay (seconds) before attempting to rebind or reconnect after a recoverable failure such as transient network error.
@@ -348,7 +363,7 @@ on that network. This is the Windows-only shape of the Linux peer above.
   "tunnelInterfaceName": "wt0",
   "transportMode": "Vxlan",
   "vxlanVni": 4096,
-  "peerAddress": "100.64.0.1"
+  "peerAddress": null
 }
 ```
 
@@ -377,8 +392,14 @@ network directly.
 
 Notes:
 
-- `vxlanVni` must match on both ends, and each `peerAddress` must point at the **other** machine's
-  tunnel IP (or use `peerName` with NetBird discovery). Here A is `100.64.0.1` and B is `100.64.0.2`.
+- `vxlanVni` must match on both ends. Each **client** points `peerAddress` at the server's tunnel
+  IP (B is `100.64.0.2` here); the server needs no `peerAddress` and learns clients automatically.
+- The server accepts multiple clients (up to `maxClients`). Unicast is sent only to the client that
+  owns the destination MAC; broadcast, multicast and unknown-unicast traffic is flooded to all
+  clients. Set `allowClientToClient: false` to keep clients from reaching each other.
+- To restrict which overlay peers may join, set `allowedClientPeers` to their tunnel IPs; otherwise
+  any peer that can reach the server's VXLAN port is accepted (the NetBird/WireGuard tunnel is the
+  authentication boundary).
 - Set `bridgeSide` to `Lan` on the bridged machine (B) and `Client` on the other (A). In `Lan` mode
   WGL2Bridge leaves the TAP's IP configuration alone so the bridge keeps the LAN's address and
   default route; running DHCP on a bridged TAP can otherwise pull an address across the tunnel.

@@ -30,8 +30,11 @@ public interface IBridgeTransport : IDisposable
     /// <summary>Number of inbound tunnel packets dropped because they came from a non-peer source.</summary>
     long DroppedNonPeer { get; }
 
-    /// <summary>Opens and binds the socket to the tunnel IP, targeting the peer.</summary>
-    void Open(IPAddress localTunnelIp, IPAddress peerIp);
+    /// <summary>Source endpoint of the last packet returned by <see cref="ReceiveAsync"/> (server mode).</summary>
+    IPEndPoint? LastReceiveSource { get; }
+
+    /// <summary>Opens and binds the socket to the tunnel IP. A null peer opens server mode (accept any source).</summary>
+    void Open(IPAddress localTunnelIp, IPAddress? peerIp);
 
     /// <summary>Writes the constant tunnel header into the reserved headroom (called once per buffer).</summary>
     void WriteHeader(Span<byte> headroom);
@@ -42,8 +45,11 @@ public interface IBridgeTransport : IDisposable
     /// </summary>
     int ValidateIncoming(ReadOnlySpan<byte> packet);
 
-    /// <summary>Sends the header + frame slice of the pooled buffer across the tunnel.</summary>
+    /// <summary>Sends the header + frame slice to the configured peer (client mode).</summary>
     ValueTask<int> SendAsync(ReadOnlyMemory<byte> buffer, int frameOffset, int frameLength, CancellationToken ct);
+
+    /// <summary>Sends the header + frame slice to an explicit endpoint (server mode / client-specific or flood).</summary>
+    ValueTask<int> SendToAsync(ReadOnlyMemory<byte> buffer, int frameOffset, int frameLength, IPEndPoint destination, CancellationToken ct);
 
     /// <summary>Receives one packet into the pooled buffer and returns its total length.</summary>
     ValueTask<int> ReceiveAsync(Memory<byte> buffer, CancellationToken ct);
