@@ -55,6 +55,9 @@ public static class BridgeLog
     /// <summary>Logs a lifecycle or milestone event.</summary>
     public static void Info(string message, string category = "Bridge") => Write(LogLevel.Information, message, category);
 
+    /// <summary>Logs very fine-grained diagnostics (periodic heartbeats, per-tick detail).</summary>
+    public static void Trace(string message, string category = "Bridge") => Write(LogLevel.Trace, message, category);
+
     /// <summary>Logs diagnostic detail (resolved config, retry counters, cached peer reuse).</summary>
     public static void Debug(string message, string category = "Bridge") => Write(LogLevel.Debug, message, category);
 

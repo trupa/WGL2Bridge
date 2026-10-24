@@ -310,10 +310,10 @@ when the overlay is not up yet, in which case the session loop resolves it later
 | `LogTapOperationalStatus()` | `void` | Enumerates the TAP NIC and logs its operational status and IPv4 addresses (warns if not `Up`). |
 | `PumpTapToTunnel(ct)` | `async Task` | The TAP → tunnel forwarding pump (see [§5](#5-data-flow-internals-two-pumps)). |
 | `PumpTunnelToTap(ct)` | `async Task` | The tunnel → TAP forwarding pump. |
-| `PumpStats(ct)` | `async Task` | Periodically logs per-direction counters; no-op if `StatsIntervalSeconds <= 0`. In server mode it also logs each connected client at `Debug`. |
-| `PumpInterfaceWatch(ct)` | `async Task` | Liveness: checks the tunnel IP is still bindable (fails → `TunnelUnavailableException` → prompt retry). Deliberately free of CLI calls so a hung process can't stall it. |
+| `PumpStats(ct)` | `async Task` | Periodically logs per-direction counters at `Debug`; no-op if `StatsIntervalSeconds <= 0`. In server mode it also logs each connected client. |
+| `PumpInterfaceWatch(ct)` | `async Task` | Liveness: checks the tunnel IP is still bindable (fails → `TunnelUnavailableException` → prompt retry). Heartbeat logged at `Trace`. Deliberately free of CLI calls so a hung process can't stall it. |
 | `IsLocalAddressPresent(IPAddress)` | `static bool` | Binds a UDP socket to the address to test whether it is still assigned locally (`WSAEADDRNOTAVAIL` ⇒ gone). |
-| `PumpHealthCheck(ct)` | `async Task` | Secondary checks on a fixed 30 s cadence: NetBird peer connected, and a "no inbound traffic while forwarding" heuristic. |
+| `PumpHealthCheck(ct)` | `async Task` | Secondary checks on a fixed 30 s cadence: NetBird peer connected, and a "no inbound traffic while forwarding" heuristic. Heartbeat logged at `Trace`. |
 | `ResolvePeerBoundedAsync(ct)` | `async Task<PeerInfo?>` | Runs peer resolution off-thread with a 10 s timeout so a hung CLI/API can't stall the loop. |
 | `PumpProbes(ct)` | `async Task` | Injects `LoopDetector.BuildProbe` frames into the TAP every `loopProbeIntervalSeconds`; no-op if loop detection is disabled. |
 | `GetMetricsSnapshot()` | `string` | Returns a `text/plain` snapshot of all counters for the metrics endpoint. In server mode it includes a `client <endpoint> idle_s <n> macs <n>` line per connected client. |
@@ -367,6 +367,7 @@ minimum level configured independently.
 | `IsInitialized` | `bool` (get) | True once `Initialize` has succeeded. |
 | `Initialize(BridgeConfig)` | `static void` | Builds the console sink and (if a path is set) the file sink; a file-open failure is reported to stderr but is non-fatal. |
 | `Info(message, category="Bridge")` | `static void` | Lifecycle / milestone events. |
+| `Trace(message, category="Bridge")` | `static void` | Very fine-grained diagnostics (periodic heartbeats, per-tick detail). |
 | `Debug(message, category="Bridge")` | `static void` | Diagnostic detail (resolved config, retries). |
 | `Warning(message, category="Bridge")` | `static void` | Recoverable conditions. |
 | `Error(message, category="Bridge")` | `static void` | Fatal / configuration failures. |
@@ -395,7 +396,7 @@ writer.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
-| `RunAsync(port, snapshot, ct)` | `static async Task<int>` → `Task` | Listens on `127.0.0.1:<port>`; accepts clients and dispatches each to `HandleClientAsync` on the thread pool. Stops on cancellation. |
+| `RunAsync(port, snapshot, ct)` | `static async Task` | Listens on `127.0.0.1:<port>` and logs the listening URL at `Information`; accepts clients and dispatches each to `HandleClientAsync` on the thread pool. Stops on cancellation. |
 | `HandleClientAsync(TcpClient, Func<string>)` | `static async Task` | Reads (and discards) the request, writes an HTTP/1.1 200 with `Content-Type: text/plain; charset=utf-8` and the `snapshot()` body, then closes. Swallows client-disconnect errors. |
 
 ---
@@ -615,7 +616,7 @@ mechanism OpenVPN uses — because higher-level APIs don't reliably deliver fram
 | `DevicePath` | `string` (get) | The device path. |
 | `MacAddress` | `ReadOnlySpan<byte>` (get) | Driver-reported MAC, refreshed on each open. |
 | `IsOpen` | `bool` (get) | True while the handle is valid. |
-| `Open()` | `void` | `CreateFile` with overlapped flag, binds the handle to the thread pool, queries the MAC, forces media status connected. Idempotent: returns immediately if the handle is already open, so the adapter's media state is not toggled on every tunnel reconnect. |
+| `Open()` | `bool` | `CreateFile` with overlapped flag, binds the handle to the thread pool, queries the MAC, forces media status connected. Idempotent: returns `false` if the handle is already open, so the adapter's media state is not toggled on every tunnel reconnect. |
 | `ReadAsync(buffer, offset, count, ct)` | `ValueTask<int>` | Overlapped read of one frame. |
 | `WriteAsync(buffer, offset, count, ct)` | `ValueTask<int>` | Overlapped write of one frame. |
 | `StartOperation(read, buffer, offset, count, ct)` | `ValueTask<int>` (private, unsafe) | Core machinery: pins the buffer, allocates a `NativeOverlapped`, registers cancellation **before** issuing I/O, handles `ERROR_IO_PENDING` (997), and cancels explicitly if the token fired mid-flight. |

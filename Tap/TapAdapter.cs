@@ -32,14 +32,15 @@ public sealed class TapAdapter : IDisposable
     /// <summary>True while the device handle is open and valid.</summary>
     public bool IsOpen => _handle is { IsClosed: false, IsInvalid: false };
 
-    /// <summary>Opens the device, queries its MAC, and forces the media status to connected.</summary>
-    public void Open()
+    /// <summary>Opens the device, queries its MAC, and forces the media status to connected.
+    /// Returns false when the handle was already open.</summary>
+    public bool Open()
     {
         // Keep the handle across tunnel reconnects. Closing/reopening it toggles the adapter's
         // media state, which is a Windows network change that can make NetBird reconnect again.
         if (IsOpen)
         {
-            return;
+            return false;
         }
 
         nint raw = WindowsNative.CreateFile(
@@ -61,6 +62,7 @@ public sealed class TapAdapter : IDisposable
 
         QueryMac();
         SetMediaStatus(connected: true);
+        return true;
     }
 
     /// <summary>Overlapped read of one Ethernet frame into <paramref name="buffer"/>.</summary>

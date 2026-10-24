@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.Versioning;
 using System.Text;
+using WGL2Bridge.Logging;
 
 namespace WGL2Bridge.Metrics;
 
@@ -17,6 +18,7 @@ public static class MetricsEndpoint
     {
         var listener = new TcpListener(IPAddress.Loopback, port);
         listener.Start();
+        BridgeLog.Info($"Metrics endpoint listening on http://127.0.0.1:{port}/");
 
         try
         {

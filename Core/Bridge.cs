@@ -56,6 +56,7 @@ public sealed class Bridge : IAsyncDisposable
     private int _firstTunnelPacketLogged;
     private int _tapMacReflectedLogged;
     private bool _tunnelUnavailableLogged;
+    private bool _firstSession = true;
     private int _lastAppliedMtu = -1;
 
     // Server (Lan) mode: clients are learned from inbound tunnel packets.
@@ -140,7 +141,8 @@ public sealed class Bridge : IAsyncDisposable
                     BridgeLog.Info($"Tunnel interface '{_config.TunnelInterfaceName}' is available again.");
                 }
 
-                BridgeLog.Info("Bridge running.");
+                LogSessionInit("Bridge running.");
+                _firstSession = false;
                 if (recovered)
                 {
                     BridgeLog.Info($"Session recovered after {reconnectAttempt} failure(s).");
@@ -339,8 +341,16 @@ public sealed class Bridge : IAsyncDisposable
         int tunnelMtu = _tunnel.Mtu;
         _bufferSize = Math.Max(2048, tunnelMtu + 128 + _transport.HeaderLength);
 
-        _tap.Open();
-        BridgeLog.Info($"TAP adapter '{_config.TapName}' opened ({_tap.DevicePath}), media state forced to connected.");
+        bool openedNow = _tap.Open();
+        if (openedNow)
+        {
+            BridgeLog.Info($"TAP adapter '{_config.TapName}' opened ({_tap.DevicePath}), media state forced to connected.");
+        }
+        else
+        {
+            BridgeLog.Debug($"TAP adapter '{_config.TapName}' already open; reusing handle.");
+        }
+
         BridgeLog.Debug($"TAP MAC '{FormatMac(_tap.MacAddress)}'.");
 
         LogTapOperationalStatus();
@@ -366,7 +376,7 @@ public sealed class Bridge : IAsyncDisposable
             BridgeLog.Debug("Bridge side is 'Lan'; not applying the TAP MTU (the network bridge owns the MTU).");
         }
 
-        BridgeLog.Info($"TAP MTU {tapMtu} (tunnel MTU {tunnelMtu} - {_transport.EncapsulationOverhead} encapsulation - {innerHeader} Ethernet header).");
+        LogSessionInit($"TAP MTU {tapMtu} (tunnel MTU {tunnelMtu} - {_transport.EncapsulationOverhead} encapsulation - {innerHeader} Ethernet header).");
 
         if (_serverMode && peerAddress is not null)
         {
@@ -374,7 +384,7 @@ public sealed class Bridge : IAsyncDisposable
         }
 
         _transport.Open(localIp, _serverMode ? null : peerAddress);
-        BridgeLog.Info($"Encapsulation active: {_transport.Description}; egress pinned to tunnel address '{localIp}'.");
+        LogSessionInit($"Encapsulation active: {_transport.Description}; egress pinned to tunnel address '{localIp}'.");
     }
 
     private void RefreshPeer()
@@ -441,11 +451,30 @@ public sealed class Bridge : IAsyncDisposable
                 $"TAP adapter '{_config.TapName}' reports '{nic.OperationalStatus}' (not Up) — the host stack will not transmit into it. " +
                 $"IPv4: {(ipv4.Length == 0 ? "none" : string.Join(", ", ipv4.Select(a => a.ToString())))}.");
         }
-        else
+        else if (_firstSession)
         {
             BridgeLog.Info(
                 $"TAP adapter '{_config.TapName}' operational status '{nic.OperationalStatus}'. " +
                 $"IPv4: {(ipv4.Length == 0 ? "none" : string.Join(", ", ipv4.Select(a => a.ToString())))}.");
+        }
+        else
+        {
+            BridgeLog.Debug(
+                $"TAP adapter '{_config.TapName}' operational status '{nic.OperationalStatus}'. " +
+                $"IPv4: {(ipv4.Length == 0 ? "none" : string.Join(", ", ipv4.Select(a => a.ToString())))}.");
+        }
+    }
+
+    /// <summary>Logs session setup detail at Info for the first session, then Debug for reconnects.</summary>
+    private void LogSessionInit(string message)
+    {
+        if (_firstSession)
+        {
+            BridgeLog.Info(message);
+        }
+        else
+        {
+            BridgeLog.Debug(message);
         }
     }
 
@@ -742,7 +771,7 @@ public sealed class Bridge : IAsyncDisposable
         {
             await Task.Delay(interval, ct).ConfigureAwait(false);
 
-            BridgeLog.Info(
+            BridgeLog.Debug(
                 $"Stats: tap→tunnel read={Interlocked.Read(ref _tapFramesRead)} forwarded={Interlocked.Read(ref _tapForwarded)} " +
                 $"filter-drop={Interlocked.Read(ref _tapFilterDropped)} mac-suppress={Interlocked.Read(ref _tapMacSuppressed)}; " +
                 $"tunnel→tap received={Interlocked.Read(ref _tunnelPacketsReceived)} written={Interlocked.Read(ref _tunnelWritten)} " +
@@ -790,7 +819,7 @@ public sealed class Bridge : IAsyncDisposable
             IPAddress? localIp = _tunnel.LocalAddress;
             bool present = localIp is not null && IsLocalAddressPresent(localIp);
 
-            BridgeLog.Debug($"InterfaceWatch: localIp='{localIp}' present={present}.");
+            BridgeLog.Trace($"InterfaceWatch: localIp='{localIp}' present={present}.");
 
             if (!present)
             {
@@ -840,7 +869,7 @@ public sealed class Bridge : IAsyncDisposable
             {
                 PeerInfo? peer = await ResolvePeerBoundedAsync(ct).ConfigureAwait(false);
 
-                BridgeLog.Debug(
+                BridgeLog.Trace(
                     $"HealthCheck: peer={(peer is null ? "null" : peer.Address.ToString())} connected={peer?.Connected}.");
 
                 if (peer is { Connected: false })
