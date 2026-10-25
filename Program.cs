@@ -52,6 +52,11 @@ public static class Program
             BridgeLog.Initialize(config);
             BridgeLog.Info("WGL2Bridge starting.");
 
+            foreach (string warning in config.GetWarnings())
+            {
+                BridgeLog.Warning($"Config: {warning}");
+            }
+
             // Check mode validates configuration and resolves the peer/tunnel/TAP without opening any device.
             if (checkMode)
             {

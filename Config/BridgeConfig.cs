@@ -176,13 +176,58 @@ public sealed record BridgeConfig
     public long LogMaxBytes { get; init; } = 10 * 1024 * 1024;
 
     /// <summary>
+    /// Allow the IP stack to fragment the encapsulated packet when a frame does not fit the tunnel
+    /// payload (frame + encapsulation overhead &gt; tunnel MTU). True by default: a bridge segment
+    /// usually runs at 1500 bytes and its MTU cannot be changed from this side, so fragmenting keeps
+    /// full-size frames flowing at ~5-8% overhead and with the usual fragment-drop risk. False makes
+    /// an MTU mismatch explicit: those frames are dropped and counted instead.
+    /// </summary>
+    public bool AllowFragmentation { get; init; } = true;
+
+    /// <summary>
     /// L2 EtherTypes to drop, as hexadecimal text with an optional '0x' prefix (e.g. "0x88CC" for
     /// LLDP). Empty means no EtherType is blocked. Applied in both directions.
     /// </summary>
-    public string[] DropEtherTypes { get; init; } = [];
+    public string[]? DropEtherTypes { get; init; }
 
-    /// <summary>Consumer discovery UDP destination ports to drop (mDNS, LLMNR, SSDP, WS-Discovery, NetBIOS, ...).</summary>
-    public int[] DropUdpPorts { get; init; } = [5353, 5355, 1900, 3702, 137, 138, 17500, 27036];
+    /// <summary>
+    /// Destination MACs to drop as link-local control protocols. <c>null</c> = built-in set (IEEE
+    /// 802.1 reserved group 01:80:C2:00:00:00-0F: STP/RSTP/MSTP, LACP, 802.1X/EAPOL, 802.3x PAUSE,
+    /// slow protocols; plus Cisco 01:00:0C:CC:CC:CC/CC:CD: CDP, VTP, DTP, UDLD, PVST+, PAgP),
+    /// explicit array = exactly these, <c>[]</c> = none. Entries are single MACs or last-octet ranges
+    /// (e.g. "01:80:C2:00:00:10-1F"). Exception: 802.3x PAUSE (01:80:C2:00:00:01) is always dropped
+    /// because 802.3 does not allow bridges to forward MAC Control frames. Emptying the list forwards
+    /// BPDUs, so startup warns that loop detection is then the only guard.
+    /// </summary>
+    public string[]? DropLinkLocalMacs { get; init; }
+
+    /// <summary>
+    /// IP protocol numbers to drop (IANA): null = built-in set (IGMP 2, EIGRP 88, OSPF 89, PIM 103,
+    /// VRRP/CARP 112), explicit array = exactly these, [] = drop none.
+    /// </summary>
+    public int[]? DropIpProtocols { get; init; }
+
+    /// <summary>
+    /// UDP destination ports to drop: null = built-in set (consumer discovery: mDNS 5353, LLMNR 5355,
+    /// SSDP 1900, WS-Discovery 3702, NetBIOS 137/138, Dropbox 17500, Steam 27036; gateway redundancy:
+    /// HSRP 1985, GLBP 3222), explicit array = exactly these, [] = drop none.
+    /// </summary>
+    public int[]? DropUdpPorts { get; init; }
+
+    /// <summary>TCP destination ports to drop; null/[] = drop none.</summary>
+    public int[]? DropTcpPorts { get; init; }
+
+    /// <summary>
+    /// ICMPv4 types to drop; null/[] = drop none. Worth blocking across a tunnel: 5 (redirect) and
+    /// 9/10 (router advertisement/solicitation).
+    /// </summary>
+    public int[]? DropIcmpv4Types { get; init; }
+
+    /// <summary>
+    /// ICMPv6 types to drop; null/[] = drop none, because an extended segment may legitimately have
+    /// one IPv6 router. Set [133, 134] (Router Solicitation/Advertisement) when each site runs its own.
+    /// </summary>
+    public int[]? DropIcmpv6Types { get; init; }
 
     /// <summary>VLAN IDs to bridge (802.1Q). When null/empty, all VLANs (and untagged) are allowed.</summary>
     public int[]? AllowVlans { get; init; }
@@ -240,33 +285,10 @@ public sealed record BridgeConfig
             errors.Add("'MaxBroadcastPps' must be >= 0.");
         if (MetricsPort is < 0 or > 65535)
             errors.Add("'MetricsPort' must be between 0 and 65535.");
-        foreach (string etherType in DropEtherTypes)
-        {
-            if (!Ethernet.TryParseEtherType(etherType, out _))
-            {
-                errors.Add($"'DropEtherTypes' contains invalid EtherType '{etherType}' (expected hex such as '0x88CC').");
-                break;
-            }
-        }
-        foreach (int port in DropUdpPorts)
-        {
-            if (port is < 0 or > 65535)
-            {
-                errors.Add($"'DropUdpPorts' contains invalid port {port}.");
-                break;
-            }
-        }
-        if (AllowVlans is not null)
-        {
-            foreach (int vlan in AllowVlans)
-            {
-                if (vlan is < 0 or > 4094)
-                {
-                    errors.Add($"'AllowVlans' contains invalid VLAN {vlan} (0..4094).");
-                    break;
-                }
-            }
-        }
+
+        // Filter groups and escape lists are resolved together: this validates every port, protocol,
+        // ICMPv6 type, EtherType, VLAN and MAC range in one place.
+        FilterPolicy.Resolve(this, errors);
         if (string.IsNullOrWhiteSpace(LogFilePath))
             errors.Add("'LogFilePath' must not be empty.");
         if (LogMaxBytes < 1024)
@@ -278,5 +300,48 @@ public sealed record BridgeConfig
             errors.Add("'TapHardwareId' must not be empty.");
 
         return errors;
+    }
+
+    /// <summary>
+    /// Non-fatal configuration problems: settings that are ignored in the current mode, or filter
+    /// lists that a group mode makes inert. Reported once at startup and by <c>--check</c>.
+    /// </summary>
+    public IReadOnlyList<string> GetWarnings()
+    {
+        var warnings = new List<string>();
+        var defaults = new BridgeConfig();
+
+        if (BridgeSide == BridgeSide.Lan)
+        {
+            if (!string.IsNullOrWhiteSpace(PeerAddress) || !string.IsNullOrWhiteSpace(PeerName))
+            {
+                warnings.Add("'PeerAddress'/'PeerName' are ignored with 'BridgeSide: Lan' — this end is the server, clients connect to it.");
+            }
+
+            if (!string.IsNullOrWhiteSpace(TapIpAddress))
+            {
+                warnings.Add("'TapIpAddress' is ignored with 'BridgeSide: Lan' — the network bridge owns the TAP addressing.");
+            }
+        }
+        else
+        {
+            if (AllowedClientPeers.Length > 0)
+            {
+                warnings.Add("'AllowedClientPeers' is ignored with 'BridgeSide: Client'.");
+            }
+
+            if (MaxClients != defaults.MaxClients ||
+                ClientAgingSeconds != defaults.ClientAgingSeconds ||
+                RemoteMacAgingSeconds != defaults.RemoteMacAgingSeconds ||
+                MaxRemoteMacs != defaults.MaxRemoteMacs ||
+                MaxUnknownMacFloodPps != defaults.MaxUnknownMacFloodPps ||
+                AllowClientToClient != defaults.AllowClientToClient)
+            {
+                warnings.Add("Client/server tuning keys ('MaxClients', 'ClientAgingSeconds', 'RemoteMacAgingSeconds', 'MaxRemoteMacs', 'MaxUnknownMacFloodPps', 'AllowClientToClient') are ignored with 'BridgeSide: Client'.");
+            }
+        }
+
+        FilterPolicy.CollectWarnings(this, warnings);
+        return warnings;
     }
 }

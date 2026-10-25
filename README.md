@@ -80,6 +80,40 @@ dotnet publish -c Release -r win-x64 -p:PublishAot=true -p:IsAotCompatible=true
 The NativeAOT executable is produced at
 `bin\Release\net10.0-windows\win-x64\publish\WGL2Bridge.exe`.
 
+## Supported topologies
+
+| Topology | Status | Notes |
+|---|---|---|
+| **Client ↔ Lan** (WGL2Bridge on both ends) | **Supported, primary** | `Client` on the remote machine (TAP gets an address via DHCP/`tapIpAddress`); `Lan` on the machine whose TAP is bridged to the physical LAN (acts as a multi-client server). |
+| **Client ↔ Linux kernel VXLAN** | **Supported** | The Linux end is a plain `vxlan` device bridged to its LAN and applies **no** filtering; all protection comes from our ingress filters. See the recipe below. |
+| **Lan ↔ Lan** (site-to-site join) | **Not supported officially** | It will probably work — both ends act as symmetric servers — but it is untested and unsupported. Neither end configures the TAP address, so the MTU must be set on both Windows bridges by hand, and two DHCP servers on the joined segment need split scopes in the same subnet. |
+
+### Linux kernel VXLAN peer (Client mode)
+
+On the Linux side (root):
+
+```sh
+ip link add vxlan0 type vxlan id 4096 dstport 4789 remote <client-tunnel-ip> nolearning
+ip link set vxlan0 mtu 1450
+ip link set vxlan0 master br0
+ip link set vxlan0 up
+# flood unknown/broadcast/multicast to the client (required with "nolearning")
+bridge fdb append 00:00:00:00:00:00 dev vxlan0 dst <client-tunnel-ip>
+```
+
+Matching settings on the Windows client:
+
+| Key | Value | Why |
+|---|---|---|
+| `vxlanVni` | `4096` | must equal the kernel `id` — a mismatch shows up as `tunnel_invalid` |
+| `vxlanDestinationPort` | `4789` | must equal `dstport` |
+| `assumeVlanTagged` | `false` | a plain Linux bridge emits untagged frames; `true` over-reserves 4 bytes of MTU |
+| `allowVlans` | `null` | setting an allow list drops every untagged frame and silently kills the link |
+| `peerAddress` | Linux tunnel IP | used for `peerSourceValidation` |
+
+The Linux end does not run our filters, so a noisy remote LAN is filtered only on ingress here —
+that is by design; the loop probe (`0x88B5`) still travels both ways, so loop detection works.
+
 ## Configuration
 
 All configuration lives in `appsettings.json` (camelCase). Below are detailed descriptions of
@@ -98,7 +132,8 @@ every notable configuration key, the expected type, and how the bridge uses the 
     traffic and forwards frames per destination MAC. It does **not** configure an address, route
     isolation or MTU on the TAP and never runs DHCP on it — the bridge (or the underlying physical
     NIC) owns the LAN address and MTU. Use `Lan` on the machine whose TAP is bridged to its
-    physical NIC.
+    physical NIC. See [Supported topologies](#supported-topologies): `Lan` ↔ `Lan` is not supported
+    officially (it will probably work, but is untested).
 
 - tunnelInterfaceName (string, default: "NetBird")
   - The friendly name of the WireGuard/NetBird tunnel interface on the host. The encapsulation socket
@@ -148,6 +183,10 @@ WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and leave `pee
 
 - peerSourceValidation (boolean, default: true)
   - Client mode: drops inbound tunnel packets that do not originate from the configured `peerAddress` or discovered NetBird peer. Ignored in `Lan` mode, where `allowedClientPeers` controls access.
+
+- allowFragmentation (boolean, default: true)
+  - What to do with a frame that does not fit the tunnel payload (`frame + encapsulation overhead > tunnel MTU`). `true` clears the DF bit so the IP stack fragments the encapsulated packet: full-size frames keep crossing at ~5–8 % overhead and with the usual risk that a path drops IP fragments. `false` drops them instead and counts them, which makes an MTU mismatch explicit rather than hidden. Either way a throttled warning names the exact MTU to configure.
+  - This matters because a bridged (`Lan`) segment's MTU **cannot be lowered from this side**: a Windows network bridge forwards L2 frames regardless of its own MTU, so hosts on the segment keep sending 1500-byte frames. Configure the segment's MTU through **DHCP option 26** (IPv4) or the **RA MTU option** (IPv6) to eliminate the need for fragmentation.
 
 - allowedClientPeers (array of strings, default: [])
   - Lan/server mode only. Optional allow-list of client tunnel IPv4 addresses. When empty, the server accepts any peer that can reach the tunnel (NetBird/WireGuard authenticates the peer).
@@ -227,11 +266,29 @@ WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and leave `pee
 - logMaxBytes (integer, default: 10485760)
   - Maximum size in bytes for the log file before rotation. When the file reaches this size it is rotated to `wgl2bridge.log.1` and a fresh file is started. Set to a larger value for long-term retention or smaller for low-disk-space environments.
 
-- dropEtherTypes (array of strings, default: `[]`)
-  - L2 EtherTypes to silently drop, given as hexadecimal text with an optional `0x` prefix (for example `"0x88CC"` blocks LLDP). Matched on the frame's inner EtherType (after any VLAN tags) and applied in both directions. Empty blocks nothing.
+Every filter key is a **list of values to drop, named after the frame field it matches**. There is no on/off flag and no grouping by concept, so a value can never be filed under the wrong idea: `null` (or omitted) means "use the built-in default set", an explicit array replaces that set, and `[]` means the key drops nothing.
 
-- dropUdpPorts (array of integers, default: `[5353,5355,1900,3702,137,138,17500,27036]`)
-  - UDP destination ports to silently drop, matched in both directions (TAP→tunnel and tunnel→TAP). These are common consumer/service discovery and broadcast ports (mDNS, LLMNR, SSDP, WS-Discovery, NetBIOS) which reduce unnecessary chattiness over the bridge.
+- dropLinkLocalMacs (array of strings|null, default: null ⇒ `["01:80:C2:00:00:00-0F", "01:00:0C:CC:CC:CC", "01:00:0C:CC:CC:CD"]`)
+  - **Destination MACs.** The default covers the IEEE 802.1 reserved group `01:80:C2:00:00:00`–`0F` (STP/RSTP/MSTP, LACP, 802.1X/EAPOL, 802.3x PAUSE, slow protocols) and Cisco `01:00:0C:CC:CC:CC`/`CC:CD` (CDP, VTP, DTP, UDLD, PVST+, PAgP). These frames carry no EtherType, so destination MAC is the only handle. Entries are single MACs or last-octet ranges such as `"01:80:C2:00:00:10-1F"`.
+  - Forwarding most of these has legitimate uses (one STP domain across a stable underlay, centralized 802.1X, VTP/CDP in a single management domain), so the list is configurable. **One exception: 802.3x PAUSE (`01:80:C2:00:00:01`) is always dropped** — 802.3 does not allow bridges to forward MAC Control frames, and a forwarded PAUSE would stall the far segment. When the list no longer drops the STP MAC, startup warns that loop detection is then the only cross-site loop guard.
+
+- dropEtherTypes (array of strings|null, default: null ⇒ `[]`)
+  - **EtherType**, as hexadecimal text with an optional `0x` prefix (e.g. `"0x88CC"` blocks LLDP). Matched on the frame's inner EtherType after any VLAN tags.
+
+- dropIpProtocols (array of integers|null, default: null ⇒ `[2, 88, 89, 103, 112]`)
+  - **IANA IP protocol number**, applied to IPv4 and to the final IPv6 next-header. The default set is IGMP 2, EIGRP 88, OSPF 89, PIM 103 (routing/multicast control must not converge across the tunnel) and VRRP/CARP 112 (gateway hellos can hand a site's VIP to the other end).
+
+- dropUdpPorts (array of integers|null, default: null ⇒ `[5353, 5355, 1900, 3702, 137, 138, 17500, 27036, 1985, 3222]`)
+  - **UDP destination port.** The default set is consumer discovery (mDNS 5353, LLMNR 5355, SSDP 1900, WS-Discovery 3702, NetBIOS 137/138, Dropbox 17500, Steam 27036) plus gateway redundancy (HSRP 1985, GLBP 3222). To keep one of them, list the rest explicitly — the list is what gets dropped.
+
+- dropTcpPorts (array of integers|null, default: null ⇒ `[]`)
+  - **TCP destination port**, empty by default (all TCP passes). Useful to block specific services across the tunnel (445, 3389, …). When empty, the TCP path skips the lookup entirely.
+
+- dropIcmpv4Types (array of integers|null, default: null ⇒ `[]`)
+  - **ICMPv4 type**, empty by default. Worth considering: `5` (redirect) and `9`/`10` (router advertisement/solicitation) — the IPv4 equivalent of an RA crossing sites.
+
+- dropIcmpv6Types (array of integers|null, default: null ⇒ `[]`)
+  - **ICMPv6 type**, empty by default because an extended segment may legitimately have one IPv6 router. Set `[133, 134]` (Router Solicitation/Advertisement) when each site runs its own — otherwise an RA from the far site installs a foreign prefix and default router on local hosts.
 
 - allowVlans (array of integers|null, default: null)
   - When set to one or more VLAN IDs, only frames tagged with one of those IDs are forwarded; untagged frames and frames with any other tag are dropped. When null (or an empty array) all VLANs are allowed and VLAN tags are preserved across encapsulation.
@@ -262,21 +319,55 @@ Run with a custom config path: `WGL2Bridge.exe path\to\config.json`.
 
 ## Filter policy
 
-Frames are forwarded by default (fail-open); restriction is opt-in. Every list below is applied in
-both directions (TAP→tunnel and tunnel→TAP).
+Frames are forwarded by default (fail-open); restriction is opt-in. Every key names **the frame
+field it matches**, so a value can only ever be in the list for the field it belongs to. `null` (or
+omitted) selects the built-in default set, an explicit array replaces it, `[]` drops nothing. All
+lists apply in both directions (TAP→tunnel and tunnel→TAP), and the effective policy is logged once
+per start:
 
-- **`dropEtherTypes`** — L2 EtherTypes to block, as hexadecimal text (e.g. `"0x88CC"` blocks LLDP),
-  matched on the frame's inner EtherType after any VLAN tags. Empty by default; do not list the
-  loop-probe EtherType `0x88B5`, as blocking it disables loop detection, and make sure the far end
-  does not drop `0x88B5` either — a loop through the tunnel is only detected if the probe is
-  allowed to travel both ways.
-- **`dropUdpPorts`** — IPv4/IPv6 UDP **destination** ports to block. Defaults to common consumer
-  discovery and host-chatter ports (mDNS 5353, LLMNR 5355, SSDP 1900, WS-Discovery 3702,
-  NetBIOS 137/138, Dropbox 17500, Steam 27036).
-- **`allowVlans`** — when set, a frame must carry an 802.1Q/QinQ tag whose VLAN ID is in the list;
-  untagged frames are dropped. When null or empty, all VLANs pass.
-- **Everything else forwards** — all TCP, ICMP, later IP fragments, and any EtherType not in
-  `dropEtherTypes` (including unrecognized types). Truncated headers fail open.
+```
+Filter: link-local=drop(18 macs) ip=drop(5 protocols) udp=drop(10 ports) tcp=none
+        icmpv4=none icmpv6=none ethertype=none vlans=all.
+```
+
+| Key | Field | Built-in set (`null` ⇒ this) | Why those defaults |
+| --- | --- | --- | --- |
+| `dropLinkLocalMacs` | destination MAC | `01:80:C2:00:00:00-0F`, `01:00:0C:CC:CC:CC`, `01:00:0C:CC:CC:CD` (PAUSE `…:01` always dropped) | STP/RSTP/MSTP, LACP, EAPOL, PAUSE, CDP/VTP/DTP/UDLD/PVST+/PAgP are per-link; bridging them makes the far switch root, or block its own uplinks, for a topology it should not see. Clear the list only for a deliberate single-domain design — startup then warns that loop detection is the only guard |
+| `dropEtherTypes` | EtherType | none | opt-in (e.g. `0x88CC` LLDP) |
+| `dropIpProtocols` | IP protocol number | `2, 88, 89, 103, 112` | IGMP/EIGRP/OSPF/PIM adjacencies, querier elections and RPF state across the tunnel (PIM can blackhole multicast for both segments) + VRRP/CARP, whose hellos can hand a site's gateway VIP to a router on the other end |
+| `dropUdpPorts` | UDP destination port | `5353, 5355, 1900, 3702, 137, 138, 17500, 27036, 1985, 3222` | consumer discovery chatter (mDNS/LLMNR/SSDP/WS-Discovery/NetBIOS/Dropbox/Steam) + HSRP/GLBP gateway hellos |
+| `dropTcpPorts` | TCP destination port | none | opt-in (block a service across the tunnel, e.g. 445/3389) |
+| `dropIcmpv4Types` | ICMPv4 type | none | opt-in (`5` redirect, `9`/`10` router advertisement — the IPv4 counterpart of an RA crossing sites) |
+| `dropIcmpv6Types` | ICMPv6 type | none | opt-in; `[133, 134]` when each site has its own IPv6 router, otherwise an RA from the far site installs a foreign prefix and default router on local hosts |
+| `allowVlans` | VLAN ID (allow-list) | `null` ⇒ all VLANs pass | — |
+
+`dropTcpPorts`, `dropIcmpv4Types` and `dropIcmpv6Types` are empty by default and their lookups are
+skipped entirely while empty, so they cost nothing until configured.
+
+Do not list the loop-probe EtherType `0x88B5` anywhere: blocking it disables loop detection, and the
+far end must not drop it either — a loop through the tunnel is only detected if the probe can travel
+both ways.
+
+**Everything else forwards** — all TCP (unless a TCP port is listed), other ICMP types, later IP
+fragments, and any EtherType not in `dropEtherTypes` (including unrecognized types). Truncated
+headers fail open.
+
+### Filter metrics
+
+Counters are generated from the effective policy, one per configured value, and appear only while
+non-zero — so you can see exactly which value is being dropped, including values you added yourself:
+
+```
+filter_mac_0180c2000000 3    ← STP BPDUs dropped
+filter_ip_89 7               ← OSPF dropped
+filter_udp_5353 41           ← mDNS dropped
+filter_vlan 0                ← omitted while zero
+tap_filter_dropped 51
+tunnel_filter_dropped 0
+```
+
+Filters are **local to each end**: the peer applies its own policy or none at all (a plain Linux
+`vxlan` interface filters nothing), so our ingress filtering is what protects our segment.
 
 ## Loop detection
 
@@ -295,7 +386,28 @@ us — the case that actually causes a broadcast storm across the link. Whicheve
 - **Route isolation before DHCP**: TAP metric forced to 9999 and `DisableDefaultRoutes=1` set, so a
   bridged-segment DHCP server cannot hijack the host's default route.
 - **MTU derivation**: `tapMtu = tunnelMtu - outerHeader - innerEthernetHeader`, re-derived and
-  re-applied every session.
+  re-applied every session. `Client` mode applies it to the TAP; `Lan` mode cannot (a bridge port has
+  no IPv4 subinterface), which is why oversized frames are detected and warned about instead of
+  silently lost.
+
+## MTU mismatch handling
+
+The largest frame that fits the tunnel is `tunnelMtu − encapsulationOverhead` (1384 bytes for a
+1420-byte tunnel with VXLAN). Frames above it mean an MTU mismatch somewhere, and each direction has
+its own cause:
+
+| Direction | Cause | Behaviour |
+| --- | --- | --- |
+| **TAP → tunnel** | the attached segment is at 1500 (`Lan` mode, or a client TAP whose MTU could not be applied) | counted (`oversized_outbound`); fragmented if `allowFragmentation` (default) or dropped (`oversized_dropped`). Either way one throttled `Warning` per minute names the MTU to set |
+| **tunnel → TAP** | the **peer** is sending frames larger than the tunnel can carry (its `vxlan0`/bridge MTU is too high) | counted (`oversized_inbound`) and warned, then forwarded — it may still be deliverable on a 1500-byte segment |
+
+`ip_fragments` counts IP fragments arriving from the tunnel: on a correctly configured link it is
+always **0**, so a non-zero value is direct evidence of an MTU mismatch (or of fragment-based
+evasion).
+
+To eliminate the mismatch on a segment you control: set **DHCP option 26** (IPv4) or the **RA MTU
+option** (IPv6) to the TAP MTU printed by `--check`. For a Linux peer, set `ip link set vxlan0 mtu
+<that value>`.
 
 ## Operations
 

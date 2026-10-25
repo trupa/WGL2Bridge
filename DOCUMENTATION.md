@@ -92,7 +92,8 @@ WGL2Bridge/
 │
 ├─ Network/
 │  ├─ Ethernet.cs                 Span-based frame parsing helpers
-│  ├─ FrameFilter.cs              EtherType / UDP-port / VLAN policy
+│  ├─ FrameFilter.cs              Frame policy engine (one table per frame field)
+│  ├─ FilterPolicy.cs             Resolved policy: per-group drop sets
 │  ├─ MacTable.cs                 Learning bridge FDB (open-addressed hash)
 │  ├─ LoopDetector.cs             0x88B5 loop probes
 │  ├─ BroadcastLimiter.cs         Per-second broadcast/multicast rate limiter
@@ -259,7 +260,8 @@ See [§8](#8-configuration-reference) for the property/knob table.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
-| `Validate()` | `IReadOnlyList<string>` | Returns a list of human-readable configuration problems (empty = valid). Checks non-empty names, valid enum, VNI/port/protocol ranges, non-negative timings, valid EtherType strings, valid UDP ports, valid VLAN IDs, log path/size, and `TapIpAddress` CIDR syntax. |
+| `Validate()` | `IReadOnlyList<string>` | Returns a list of human-readable configuration problems (empty = valid). Resolves the whole filter policy (ports, protocols, ICMPv6 types, EtherTypes, VLANs, MAC ranges) plus names, enum, VNI ranges, timings, log settings and `TapIpAddress` CIDR syntax. |
+| `GetWarnings()` | `IReadOnlyList<string>` | Non-fatal problems: keys ignored in the current `BridgeSide` (`PeerAddress`/`PeerName`/`TapIpAddress` in `Lan`; `AllowedClientPeers` and the client/server tuning keys in `Client`). Logged once at startup and by `--check`. |
 
 #### `TransportMode` enum
 
@@ -273,7 +275,15 @@ See [§8](#8-configuration-reference) for the property/knob table.
 | Value | Meaning |
 | ----- | ------- |
 | `Client` | Default. The TAP is a standalone adapter: WGL2Bridge configures its address (DHCP or `TapIpAddress`), applies route isolation and renews DHCP after reconnect. |
-| `Lan` | The TAP is a port of a Windows network bridge; the bridge/underlying NIC owns the LAN address. WGL2Bridge skips TAP address configuration, route isolation, MTU and DHCP renewal. |
+| `Lan` | The TAP is a port of a Windows network bridge; the bridge/underlying NIC owns the LAN address. WGL2Bridge skips TAP address configuration, route isolation, MTU and DHCP renewal. Acts as the **multi-client server** side. |
+
+#### Supported topologies
+
+| Topology | Status |
+| -------- | ------ |
+| Client ↔ Lan (both ends WGL2Bridge) | Supported, primary deployment. |
+| Client ↔ Linux kernel VXLAN bridged to its LAN | Supported; the peer applies no filters, so protection is inbound-only on our side. |
+| Lan ↔ Lan (site-to-site join) | **Not officially supported** (expected to work as a symmetric server pair, but untested; MTU must be set manually on both Windows bridges and two DHCP servers would need split scopes in one subnet). |
 
 #### `ConfigJsonContext` (`Config/ConfigJsonContext.cs`)
 
@@ -296,10 +306,10 @@ the adapter being destroyed/recreated or the peer address changing.
 
 **Constructor** `Bridge(config, peerAddress, peerProvider, tapDevicePath, tapAdapterId)`
 Builds all collaborators: `TapAdapter`, `TapNetworkConfigurator`, `IBridgeTransport` (via factory),
-`FrameFilter`, `MacTable` (capacity 2048), `LoopDetector`, two `BroadcastLimiter`s, an
-`UnknownMacFloodLimiter`, and a `WireGuardInterface` named from config. `peerAddress` is nullable:
-it may be unresolved at startup when the overlay is not up yet, in which case the session loop
-resolves it later.
+`FrameFilter` over a resolved `FilterPolicy`, `MacTable` (capacity 2048), `LoopDetector`, two
+`BroadcastLimiter`s, an `UnknownMacFloodLimiter`, and a `WireGuardInterface` named from config.
+`peerAddress` is nullable: it may be unresolved at startup when the overlay is not up yet, in which
+case the session loop resolves it later.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
@@ -318,7 +328,7 @@ resolves it later.
 | `PumpHealthCheck(ct)` | `async Task` | Secondary checks on a fixed 30 s cadence: NetBird peer connected, and a "no inbound traffic while forwarding" heuristic. Heartbeat logged at `Trace`. |
 | `ResolvePeerBoundedAsync(ct)` | `async Task<PeerInfo?>` | Runs peer resolution off-thread with a 10 s timeout so a hung CLI/API can't stall the loop. |
 | `PumpProbes(ct)` | `async Task` | Every `loopProbeIntervalSeconds` builds one `LoopDetector` probe and both writes it to the TAP and sends it over the tunnel (single peer in client mode, all clients via `FloodToClientsAsync` in server mode), so loops formed on the local segment and loops formed through the tunnel are both observable. Rents `transport.HeaderLength + LoopDetector.ProbeLength` and pre-writes the transport header. No-op if loop detection is disabled. |
-| `GetMetricsSnapshot()` | `string` | Returns a `text/plain` snapshot of all counters for the metrics endpoint. In server mode it includes a `client <endpoint> idle_s <n> macs <n>` line per connected client. |
+| `GetMetricsSnapshot()` | `string` | Returns a `text/plain` snapshot of all counters for the metrics endpoint, including one generated counter per configured filter value (`filter_mac_…`, `filter_ethertype_…`, `filter_ip_…`, `filter_udp_…`, `filter_tcp_…`, `filter_icmpv4_…`, `filter_icmpv6_…`, `filter_vlan`), emitted only while non-zero. In server mode it includes a `client <endpoint> idle_s <n> macs <n>` line per connected client. |
 | `OnLoopDetected()` | `void` | Logs a loop error; sets `_stopRequested` + cancels the session when `StopOnLoopDetected`, else warns and continues. |
 | `LogSessionFailure(Exception, ref string?, int)` | `void` | Logs a session failure, de-duplicating repeated identical messages to `Debug`. |
 | `FormatMac(ReadOnlySpan<byte>)` | `static string` | Formats a 6-byte MAC as `AA:BB:CC:DD:EE:FF`. |
@@ -507,16 +517,43 @@ CLI schema is not version-stable.
 
 #### `FrameFilter` (`Network/FrameFilter.cs`)
 
-`public sealed class FrameFilter` — forwarding policy: forward by default (fail-open) with opt-in
-restrictions. Uses 64 KiB `bool[]` bitfields for O(1), zero-allocation lookups.
+`public sealed class FrameFilter` — evaluates a pre-resolved `FilterPolicy` and reports which group
+rejected a frame. Every lookup is a pre-built table or `HashSet` — O(1) and allocation free.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
-| `FrameFilter(dropEtherTypes, dropUdpPorts, allowVlans)` | ctor | Builds the EtherType/UDP-port drop tables and the optional VLAN allow set (a non-empty set enables VLAN filtering). |
-| `Allow(ReadOnlySpan<byte> frame)` | `bool` | Main entry: truncated frame → pass; VLAN check; EtherType block check; then IPv4/IPv6 specific UDP checks; everything else passes. |
+| `FrameFilter(FilterPolicy)` | ctor | Takes the resolved policy (see `FilterPolicy.Resolve`); the filter itself holds no configuration parsing. |
+| `Allow(frame)` | `bool` | Convenience overload ignoring the reason. |
+| `Allow(frame, out FilterDrop drop)` | `bool` | Main entry: truncated frame → pass; destination-MAC table; VLAN allow-list; EtherType table; then IPv4/IPv6 evaluation. `drop` carries the field that rejected the frame plus the value that matched. |
+| `IsLinkLocal(frame, macs, out mac)` | `static bool` | Multicast-bit check plus one `HashSet<ulong>` lookup; returns the destination MAC so the drop can be attributed. |
 | `VlanAllowed(frame)` | `bool` | True when VLAN filtering is off, or the frame carries an allowed 802.1Q/QinQ tag. Untagged frames are dropped only when an allow list is configured. |
-| `AllowIpv4(ReadOnlySpan<byte> ip)` | `bool` | All TCP passes; UDP destination port is checked against `_dropUdpPorts`; later fragments and ICMP/GRE/etc. pass; truncated headers pass. |
-| `AllowIpv6(ReadOnlySpan<byte> ip)` | `bool` | Walks extension headers (0/43/60), passes fragments (44), TCP, and evaluates UDP destination ports; unusual cases pass. |
+| `AllowIpv4(ip, out drop)` | `bool` | Protocol table, then ICMPv4 type (when configured) or TCP/UDP port; later fragments and other protocols pass; truncated headers pass. |
+| `AllowIpv6(ip, out drop)` | `bool` | Walks extension headers (0/43/60), passes fragments (44), checks the final next-header against the protocol table, ICMPv6 types, then TCP/UDP ports. |
+| `AllowTransport(ip, ihl, isUdp, out drop)` | `bool` | IPv4 transport-port lookup; later fragments and truncated headers pass. |
+| `AllowTransport6(ip, offset, isUdp, out drop)` | `bool` | Same for an IPv6 transport header at `offset`. |
+
+#### `FilterPolicy` (`Network/FilterPolicy.cs`)
+
+`public sealed class FilterPolicy` — the effective policy: one plain list per frame field, so a value
+can only be in the list for the field it belongs to. Config semantics: `null` means the built-in
+default set, an explicit array replaces it, `[]` means "drop nothing" — there is no separate
+enable/disable flag and no concept grouping.
+One rule is not configurable: **802.3x PAUSE (`01:80:C2:00:00:01`) is always dropped**, because 802.3
+does not allow bridges to forward MAC Control frames. `CollectWarnings` reports a destination-MAC list
+that no longer drops STP BPDUs, since cross-site loop protection then rests solely on `LoopDetector`.
+
+| Member | Kind | Description |
+| ------ | ---- | ----------- |
+| `FilterDropReason` | enum | `None`, `LinkLocal`, `Vlan`, `EtherType`, `IpProtocol`, `UdpPort`, `TcpPort`, `Icmpv4Type`, `Icmpv6Type`. |
+| `FilterDrop` | `readonly record struct` | `(FilterDropReason Reason, ulong Value)` — the field that matched and the exact value; `FilterDrop.None` for a forwarded frame. |
+| `DefaultLinkLocalMacs` | `string[]` | `01:80:C2:00:00:00-0F`, Cisco `01:00:0C:CC:CC:CC`/`CC:CD`. |
+| `DefaultIpProtocols` | `int[]` | `2, 88, 89, 103, 112` (IGMP/EIGRP/OSPF/PIM + VRRP/CARP). |
+| `DefaultUdpPorts` | `int[]` | The eight discovery ports plus HSRP `1985` and GLBP `3222`. |
+| `Resolve(config, errors?)` | `static FilterPolicy` | Builds the tables and the configured-value arrays, honouring null ⇒ built-in / array ⇒ replacement / empty ⇒ none; always adds the PAUSE MAC; appends validation errors (invalid ports, protocols, ICMP types, EtherTypes, VLANs, MAC ranges). Called by `BridgeConfig.Validate`. |
+| `CollectWarnings(config, warnings)` | `static void` | Warns when `DropLinkLocalMacs` no longer drops the STP MAC (loop detection becomes the only cross-site guard). Called by `BridgeConfig.GetWarnings`. |
+| `Description` | `string` | One-line effective-policy summary logged once at session start. |
+| `…Values` properties | `int[]` / `ushort[]` / `ulong[]` | The configured values in configuration order; the bridge sizes one counter per entry from these and names metrics after them. |
+| `HasTcpPorts` / `HasIcmpv4Types` / `HasIcmpv6Types` | `bool` | False when that list is empty, so `FrameFilter` skips the lookup on the hot path. |
 
 #### `MacTable` (`Network/MacTable.cs`)
 
@@ -827,6 +864,14 @@ must run matching software.
 `public static class TransportFactory` — `Create(BridgeConfig)` switches on `TransportMode` to return
 `RawTransport` or `VxlanTransport`; throws `ArgumentOutOfRangeException` on an unknown mode.
 
+#### `SocketTuning` (`Transport/SocketTuning.cs`)
+
+`internal static class SocketTuning` — shared socket preparation. `ApplyFragmentPolicy(socket,
+allowFragmentation)` sets `DontFragment = !allowFragmentation` so an oversized encapsulated packet is
+fragmented by the IP stack instead of failing the send with `WSAEMSGSIZE`; a failure to set the option
+is logged at `Debug` and the OS default applies. Called from `VxlanTransport.Open` and
+`RawTransport.Open`.
+
 ---
 
 ## 8. Configuration reference
@@ -846,6 +891,7 @@ must run matching software.
 | `vxlanDestinationPort` | int | `4789` | VXLAN UDP destination port. |
 | `rawIpProtocol` | int | `99` | IPv4 protocol number for Raw mode (1..255). |
 | `peerSourceValidation` | bool | `true` | Drop inbound packets whose source is not the peer. |
+| `allowFragmentation` | bool | `true` | Clear the DF bit so an oversized encapsulated packet is fragmented by the IP stack instead of failing the send; false drops and counts those frames. |
 | `allowedClientPeers` | string[] | `[]` | Lan/server mode: optional allow-list of client tunnel IPs; empty accepts any overlay peer. |
 | `allowClientToClient` | bool | `true` | Lan/server mode: allow clients to reach each other through the server. |
 | `maxClients` | int | `64` | Lan/server mode: maximum tracked clients. |
@@ -873,8 +919,13 @@ must run matching software.
 | `fileLogLevel` | LogLevel | `"Debug"` | Minimum file level. |
 | `logFilePath` | string | `"wgl2bridge.log"` | Plain-text log path. |
 | `logMaxBytes` | long | `10485760` | Rotation threshold. |
-| `dropEtherTypes` | string[] | `[]` | L2 EtherTypes to drop (hex text). |
-| `dropUdpPorts` | int[] | `[5353,5355,1900,3702,137,138,17500,27036]` | UDP destination ports to drop. |
+| `dropEtherTypes` | string[]? | `null` | EtherTypes to drop (hex text); null/`[]` ⇒ none. |
+| `dropLinkLocalMacs` | string[]? | `null` | Destination MACs; null ⇒ `01:80:C2:00:00:00-0F` + Cisco CDP/PVST+ MACs; array ⇒ exactly those; `[]` ⇒ none (PAUSE always dropped). |
+| `dropIpProtocols` | int[]? | `null` | IP protocol numbers; null ⇒ `[2,88,89,103,112]`. |
+| `dropUdpPorts` | int[]? | `null` | UDP destination ports; null ⇒ the eight discovery ports + `[1985,3222]`. |
+| `dropTcpPorts` | int[]? | `null` | TCP destination ports; null/`[]` ⇒ none (lookup skipped). |
+| `dropIcmpv4Types` | int[]? | `null` | ICMPv4 types; null/`[]` ⇒ none; e.g. `[5]` for redirects. |
+| `dropIcmpv6Types` | int[]? | `null` | ICMPv6 types; null/`[]` ⇒ none; `[133,134]` drops Router Solicitation/Advertisement. |
 | `allowVlans` | int[]? | `null` | VLAN allow list; null/empty ⇒ all VLANs allowed. |
 | `netbirdCliPath` | string? | `null` | Explicit path to `netbird.exe`. |
 
@@ -921,19 +972,54 @@ must run matching software.
 `tapMtu = tunnelMtu − encapsulationOverhead − innerEthernetHeader`, clamped to `[576, 9000]`, where
 `innerEthernetHeader = 18` when `assumeVlanTagged` else `14`.
 
+`Client` mode applies that MTU to the TAP. `Lan` mode does not: a Windows network bridge forwards L2
+frames regardless of its own MTU, so the attached segment keeps its MTU and **cannot be lowered from
+this side** — the fix is DHCP option 26 / the RA MTU option on the segment.
+
+Consequences implemented in `Bridge`:
+
+- `_maxInnerFrame = tunnelMtu − encapsulationOverhead` (largest frame that fits the tunnel).
+- **TAP → tunnel** above that limit: counted (`_oversizedOutbound`), warned at most once a minute, then
+  fragmented (if `allowFragmentation`, the default) or dropped (`_oversizedDropped`). Dropping instead
+  of fragmenting would otherwise fail the send with `WSAEMSGSIZE` and tear the session down.
+- **tunnel → TAP** above that limit: counted (`_oversizedInbound`) and warned, then forwarded — the
+  frame may still be deliverable on the far segment; it signals a peer MTU that is too high.
+- `_ipFragments` counts inbound IP fragments (IPv4 MF/non-zero offset, IPv6 fragment header). A
+  non-zero value on a healthy link means an MTU mismatch or fragment-based evasion.
+- The receive buffer is sized for a 9000-byte frame plus headers, so an oversized datagram is received
+  intact and diagnosed rather than silently truncated.
+- `SocketTuning.ApplyFragmentPolicy` sets `DontFragment = !allowFragmentation` on the encapsulation
+  socket (`Transport/SocketTuning.cs`).
+
 ---
 
 ## 10. Filtering & forwarding policy
 
-Applied by `FrameFilter.Allow` in **both** directions:
+Applied by `FrameFilter.Allow` in **both** directions. Each check is a single field, so the drop is
+always attributable to one configured value:
 
 1. **Truncated frame** (`< 14` bytes) → forward (fail-open).
-2. **VLAN allow list** (if configured) → the frame must carry an allowed 802.1Q/QinQ tag; untagged
+2. **Destination MAC** (`dropLinkLocalMacs`, default the 802.1 reserved group `01:80:C2:00:00:00`–`0F`
+   + Cisco `01:00:0C:CC:CC:CC`/`CC:CD`) → match drops the frame. These are 802.3/LLC frames with no
+   EtherType, so no other check can catch them. 802.3x PAUSE (`…:01`) is dropped even when the list is
+   cleared. Clearing the list forwards BPDUs, which startup reports as a warning because
+   `LoopDetector` is then the only cross-site loop guard.
+3. **VLAN allow list** (if configured) → the frame must carry an allowed 802.1Q/QinQ tag; untagged
    frames are dropped. If not configured, all VLANs (and untagged) pass.
-3. **EtherType block list** (`dropEtherTypes`) → inner EtherType match drops the frame.
-4. **IPv4/IPv6 UDP** → all TCP passes; fragmented/later fragments pass; UDP destination port in
-   `dropUdpPorts` drops the frame; truncated headers pass.
-5. **Everything else** (ICMP, GRE, unrecognized EtherTypes, …) → forwards.
+4. **EtherType** (`dropEtherTypes`) → inner EtherType match drops the frame.
+5. **IP protocol number** (`dropIpProtocols`, default `2/88/89/103/112`) → checked on IPv4 and on the
+   final IPv6 next-header, so routing/multicast-control convergence and VRRP/CARP cannot span the
+   tunnel.
+6. **ICMPv6 type** (`dropIcmpv6Types`, empty by default) → `[133,134]` drops Router
+   Solicitation/Advertisement.
+7. **ICMPv4 type** (`dropIcmpv4Types`, empty by default; only when configured).
+8. **TCP / UDP destination port** (`dropTcpPorts` / `dropUdpPorts`, the latter defaulting to the eight
+   discovery ports + HSRP/GLBP) → later fragments and truncated transport headers pass. The TCP
+   lookup is skipped entirely while `dropTcpPorts` is empty.
+9. **Everything else** (other ICMP types, GRE, unrecognized EtherTypes, …) → forwards.
+
+Every drop is reported as a `FilterDrop(Reason, Value)` and charged to a counter generated for that
+exact configured value (`filter_udp_5353`, `filter_ip_89`, `filter_mac_0180c2000000`, …).
 
 Then per direction:
 

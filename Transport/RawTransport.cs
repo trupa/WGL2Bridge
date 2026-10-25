@@ -18,6 +18,7 @@ public sealed class RawTransport : IBridgeTransport
 {
     private readonly int _protocol;
     private readonly bool _validatePeerSource;
+    private readonly bool _allowFragmentation;
     private readonly IPEndPoint _remote = new(IPAddress.Any, 0);
     private Socket? _socket;
     private IPEndPoint? _peer;
@@ -28,6 +29,7 @@ public sealed class RawTransport : IBridgeTransport
     {
         _protocol = config.RawIpProtocol;
         _validatePeerSource = config.PeerSourceValidation;
+        _allowFragmentation = config.AllowFragmentation;
     }
 
     public TransportMode Mode => TransportMode.Raw;
@@ -47,6 +49,7 @@ public sealed class RawTransport : IBridgeTransport
     public void Open(IPAddress localTunnelIp, IPAddress? peerIp)
     {
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Raw, (ProtocolType)_protocol);
+        SocketTuning.ApplyFragmentPolicy(_socket, _allowFragmentation);
         _socket.Bind(new IPEndPoint(localTunnelIp, 0));
         _peer = peerIp is null ? null : new IPEndPoint(peerIp, 0);
         LastReceiveSource = null;

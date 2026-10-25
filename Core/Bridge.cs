@@ -31,10 +31,21 @@ public sealed class Bridge : IAsyncDisposable
     private readonly TapNetworkConfigurator _networkConfigurator;
     private readonly IBridgeTransport _transport;
     private readonly FrameFilter _filter;
+    private readonly FilterPolicy _filterPolicy;
     private readonly MacTable _macTable;
     private readonly LoopDetector _loopDetector;
     private readonly WireGuardInterface _tunnel;
     private int _bufferSize = 2048;
+
+    // Largest frame that fits the tunnel payload (tunnel MTU - encapsulation overhead). Frames above
+    // it cannot cross without IP fragmentation, which almost always means an MTU mismatch.
+    private int _maxInnerFrame = 1500;
+    private int _tapMtu;
+    private long _oversizedOutbound;
+    private long _oversizedInbound;
+    private long _oversizedDropped;
+    private long _ipFragments;
+    private long _lastOversizeWarnMs;
 
     private long _tapFramesRead;
     private long _tapFilterDropped;
@@ -51,6 +62,17 @@ public sealed class Bridge : IAsyncDisposable
 
     private readonly BroadcastLimiter _broadcastTap;
     private readonly BroadcastLimiter _broadcastTunnel;
+
+    // One counter per configured filter value, generated from the effective policy, so the metrics
+    // endpoint can name exactly which port/protocol/MAC is being dropped.
+    private readonly long[] _linkLocalDrops;
+    private readonly long[] _etherTypeDrops;
+    private readonly long[] _ipProtocolDrops;
+    private readonly long[] _udpPortDrops;
+    private readonly long[] _tcpPortDrops;
+    private readonly long[] _icmpv4Drops;
+    private readonly long[] _icmpv6Drops;
+    private long _vlanDropped;
 
     private int _firstTapFrameLogged;
     private int _firstTunnelPacketLogged;
@@ -136,7 +158,15 @@ public sealed class Bridge : IAsyncDisposable
         _tap = new TapAdapter(tapDevicePath);
         _networkConfigurator = new TapNetworkConfigurator(config, tapAdapterId);
         _transport = TransportFactory.Create(config);
-        _filter = new FrameFilter(config.DropEtherTypes, config.DropUdpPorts, config.AllowVlans);
+        _filterPolicy = FilterPolicy.Resolve(config);
+        _filter = new FrameFilter(_filterPolicy);
+        _linkLocalDrops = new long[_filterPolicy.LinkLocalMacValues.Length];
+        _etherTypeDrops = new long[_filterPolicy.EtherTypeValues.Length];
+        _ipProtocolDrops = new long[_filterPolicy.IpProtocolValues.Length];
+        _udpPortDrops = new long[_filterPolicy.UdpPortValues.Length];
+        _tcpPortDrops = new long[_filterPolicy.TcpPortValues.Length];
+        _icmpv4Drops = new long[_filterPolicy.Icmpv4Values.Length];
+        _icmpv6Drops = new long[_filterPolicy.Icmpv6Values.Length];
         _macTable = new MacTable(2048, TimeSpan.FromSeconds(config.MacAgingSeconds));
         _loopDetector = new LoopDetector();
         _broadcastTap = new BroadcastLimiter(config.MaxBroadcastPps);
@@ -168,6 +198,7 @@ public sealed class Bridge : IAsyncDisposable
                 }
 
                 LogSessionInit("Bridge running.");
+                LogSessionInit(_filterPolicy.Description);
                 _firstSession = false;
                 if (recovered)
                 {
@@ -365,7 +396,10 @@ public sealed class Bridge : IAsyncDisposable
 
         IPAddress localIp = _tunnel.LocalAddress!;
         int tunnelMtu = _tunnel.Mtu;
-        _bufferSize = Math.Max(2048, tunnelMtu + 128 + _transport.HeaderLength);
+
+        // Size the receive buffer for the worst case a peer can send (jumbo frame) so an oversized
+        // datagram is received intact and can be diagnosed instead of being silently truncated.
+        _bufferSize = Math.Max(2048, Math.Max(tunnelMtu, 9000) + 128 + _transport.HeaderLength);
 
         bool openedNow = _tap.Open();
         if (openedNow)
@@ -383,6 +417,8 @@ public sealed class Bridge : IAsyncDisposable
 
         int tapMtu = _networkConfigurator.DeriveTapMtu(tunnelMtu, _transport.EncapsulationOverhead);
         int innerHeader = _config.AssumeVlanTagged ? 18 : 14;
+        _tapMtu = tapMtu;
+        _maxInnerFrame = Math.Max(576, tunnelMtu - _transport.EncapsulationOverhead);
 
         // The client side owns the TAP's IP stack, so its MTU is applied here. In Lan mode the TAP
         // is a network-bridge port with no IPv4 subinterface of its own: the bridge/NIC owns the
@@ -403,6 +439,9 @@ public sealed class Bridge : IAsyncDisposable
         }
 
         LogSessionInit($"TAP MTU {tapMtu} (tunnel MTU {tunnelMtu} - {_transport.EncapsulationOverhead} encapsulation - {innerHeader} Ethernet header).");
+        LogSessionInit(
+            $"Largest frame that fits the tunnel: {_maxInnerFrame} bytes; frames above it are " +
+            (_config.AllowFragmentation ? "IP-fragmented." : "dropped (AllowFragmentation is false)."));
 
         if (_serverMode && peerAddress is not null)
         {
@@ -530,10 +569,25 @@ public sealed class Bridge : IAsyncDisposable
                 }
 
                 ReadOnlySpan<byte> frame = buffer.AsSpan(headroom, frameLength);
-                if (!_filter.Allow(frame))
+                if (!_filter.Allow(frame, out FilterDrop tapDrop))
                 {
                     Interlocked.Increment(ref _tapFilterDropped);
+                    RecordFilterDrop(tapDrop);
                     continue;
+                }
+
+                if (frameLength > _maxInnerFrame)
+                {
+                    Interlocked.Increment(ref _oversizedOutbound);
+                    WarnOversized(frameLength, outbound: true);
+
+                    if (!_config.AllowFragmentation)
+                    {
+                        // Dropping is the only alternative to fragmentation: the send would fail with
+                        // WSAEMSGSIZE and tear the session down.
+                        Interlocked.Increment(ref _oversizedDropped);
+                        continue;
+                    }
                 }
 
                 long nowMs = Environment.TickCount64;
@@ -662,10 +716,25 @@ public sealed class Bridge : IAsyncDisposable
                 }
 
                 ReadOnlySpan<byte> frame = buffer.AsSpan(frameOffset, packetLength - frameOffset);
-                if (!_filter.Allow(frame))
+                if (!_filter.Allow(frame, out FilterDrop tunnelDrop))
                 {
                     Interlocked.Increment(ref _tunnelFilterDropped);
+                    RecordFilterDrop(tunnelDrop);
                     continue;
+                }
+
+                int innerLength = packetLength - frameOffset;
+                if (innerLength > _maxInnerFrame)
+                {
+                    // Forward it anyway: it may be perfectly deliverable on the LAN side. This is a
+                    // signal that the peer's MTU is too high, not a reason to drop.
+                    Interlocked.Increment(ref _oversizedInbound);
+                    WarnOversized(innerLength, outbound: false);
+                }
+
+                if (IsIpFragment(frame))
+                {
+                    Interlocked.Increment(ref _ipFragments);
                 }
 
                 long nowMs = Environment.TickCount64;
@@ -839,6 +908,8 @@ public sealed class Bridge : IAsyncDisposable
                 $"invalid={Interlocked.Read(ref _tunnelInvalid)} filter-drop={Interlocked.Read(ref _tunnelFilterDropped)} " +
                 $"mac-suppress={Interlocked.Read(ref _tunnelMacSuppressed)}; " +
                 $"storm-drop={Interlocked.Read(ref _broadcastDropped)} non-peer-drop={_transport.DroppedNonPeer}" +
+                $" oversized-out={Interlocked.Read(ref _oversizedOutbound)} oversized-in={Interlocked.Read(ref _oversizedInbound)} " +
+                $"oversized-dropped={Interlocked.Read(ref _oversizedDropped)} fragments={Interlocked.Read(ref _ipFragments)}" +
                 (_serverMode
                     ? $" clients={SnapshotClients().Length} client-forward={Interlocked.Read(ref _clientForwarded)} " +
                       $"client-drop={Interlocked.Read(ref _clientDropped)} rejected={Interlocked.Read(ref _clientRejected)} " +
@@ -1041,8 +1112,201 @@ public sealed class Bridge : IAsyncDisposable
         $"unknown_mac_dropped {Interlocked.Read(ref _unknownMacDropped)}\n" +
         $"remote_mac_owner_gone {Interlocked.Read(ref _remoteMacOwnerGone)}\n" +
         $"remote_macs_evicted {Interlocked.Read(ref _remoteMacsEvicted)}\n" +
+        $"oversized_outbound {Interlocked.Read(ref _oversizedOutbound)}\n" +
+        $"oversized_inbound {Interlocked.Read(ref _oversizedInbound)}\n" +
+        $"oversized_dropped {Interlocked.Read(ref _oversizedDropped)}\n" +
+        $"ip_fragments {Interlocked.Read(ref _ipFragments)}\n" +
+        BuildFilterReport() +
         (_serverMode ? BuildClientReport() : string.Empty) +
         $"loop_detected {(_loopDetector.LoopDetected ? 1 : 0)}\n";
+
+    /// <summary>Per-configured-value filter drops, omitted while zero.</summary>
+    private string BuildFilterReport()
+    {
+        var lines = new List<string>();
+
+        for (int i = 0; i < _linkLocalDrops.Length; i++)
+        {
+            long total = Interlocked.Read(ref _linkLocalDrops[i]);
+            if (total > 0)
+            {
+                lines.Add($"filter_mac_{_filterPolicy.LinkLocalMacValues[i]:x12} {total}\n");
+            }
+        }
+
+        for (int i = 0; i < _etherTypeDrops.Length; i++)
+        {
+            long total = Interlocked.Read(ref _etherTypeDrops[i]);
+            if (total > 0)
+            {
+                lines.Add($"filter_ethertype_{_filterPolicy.EtherTypeValues[i]:x4} {total}\n");
+            }
+        }
+
+        AppendFilterLines(lines, "filter_ip_", _filterPolicy.IpProtocolValues, _ipProtocolDrops);
+        AppendFilterLines(lines, "filter_udp_", _filterPolicy.UdpPortValues, _udpPortDrops);
+        AppendFilterLines(lines, "filter_tcp_", _filterPolicy.TcpPortValues, _tcpPortDrops);
+        AppendFilterLines(lines, "filter_icmpv4_", _filterPolicy.Icmpv4Values, _icmpv4Drops);
+        AppendFilterLines(lines, "filter_icmpv6_", _filterPolicy.Icmpv6Values, _icmpv6Drops);
+
+        long vlanDropped = Interlocked.Read(ref _vlanDropped);
+        if (vlanDropped > 0)
+        {
+            lines.Add($"filter_vlan {vlanDropped}\n");
+        }
+
+        return lines.Count == 0 ? string.Empty : string.Concat(lines);
+    }
+
+    private static void AppendFilterLines(List<string> lines, string prefix, int[] values, long[] counters)
+    {
+        for (int i = 0; i < counters.Length; i++)
+        {
+            long total = Interlocked.Read(ref counters[i]);
+            if (total > 0)
+            {
+                lines.Add($"{prefix}{values[i]} {total}\n");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Charges a drop to the counter of the exact configured value that matched. Safe to scan: this
+    /// only runs for frames that were actually dropped, and the arrays hold only configured entries.
+    /// </summary>
+    private void RecordFilterDrop(FilterDrop drop)
+    {
+        switch (drop.Reason)
+        {
+            case FilterDropReason.LinkLocal:
+                IncrementCounter(_linkLocalDrops, Array.IndexOf(_filterPolicy.LinkLocalMacValues, drop.Value));
+                break;
+
+            case FilterDropReason.EtherType:
+                IncrementCounter(_etherTypeDrops, Array.IndexOf(_filterPolicy.EtherTypeValues, (ushort)drop.Value));
+                break;
+
+            case FilterDropReason.IpProtocol:
+                IncrementCounter(_ipProtocolDrops, Array.IndexOf(_filterPolicy.IpProtocolValues, (int)drop.Value));
+                break;
+
+            case FilterDropReason.UdpPort:
+                IncrementCounter(_udpPortDrops, Array.IndexOf(_filterPolicy.UdpPortValues, (int)drop.Value));
+                break;
+
+            case FilterDropReason.TcpPort:
+                IncrementCounter(_tcpPortDrops, Array.IndexOf(_filterPolicy.TcpPortValues, (int)drop.Value));
+                break;
+
+            case FilterDropReason.Icmpv4Type:
+                IncrementCounter(_icmpv4Drops, Array.IndexOf(_filterPolicy.Icmpv4Values, (int)drop.Value));
+                break;
+
+            case FilterDropReason.Icmpv6Type:
+                IncrementCounter(_icmpv6Drops, Array.IndexOf(_filterPolicy.Icmpv6Values, (int)drop.Value));
+                break;
+
+            case FilterDropReason.Vlan:
+                Interlocked.Increment(ref _vlanDropped);
+                break;
+        }
+    }
+
+    private static void IncrementCounter(long[] counters, int index)
+    {
+        if (index >= 0 && index < counters.Length)
+        {
+            Interlocked.Increment(ref counters[index]);
+        }
+    }
+
+    /// <summary>
+    /// Logs at most one MTU warning per minute: an undersized tunnel would otherwise produce one line
+    /// per full-size frame.
+    /// </summary>
+    private void WarnOversized(int frameLength, bool outbound)
+    {
+        long now = Environment.TickCount64;
+        long last = Interlocked.Read(ref _lastOversizeWarnMs);
+        if (now - last < 60_000)
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _lastOversizeWarnMs, now, last) != last)
+        {
+            return; // another pump already warned
+        }
+
+        if (outbound)
+        {
+            string action = _config.AllowFragmentation
+                ? "Fragmented by the IP stack (allowFragmentation=true)."
+                : "Dropped (allowFragmentation=false).";
+            BridgeLog.Warning(
+                $"TAP→tunnel: frame of {frameLength} bytes exceeds the tunnel payload limit of {_maxInnerFrame} bytes " +
+                $"(tunnel MTU {_tunnel.Mtu} - {_transport.EncapsulationOverhead} encapsulation). {action} " +
+                $"Lower the bridged segment's MTU to {_tapMtu} bytes (DHCP option 26 / RA MTU) to avoid this.");
+        }
+        else
+        {
+            BridgeLog.Warning(
+                $"tunnel→TAP: received a {frameLength}-byte frame, above the tunnel payload limit of {_maxInnerFrame} bytes — " +
+                $"the peer is sending frames larger than the tunnel carries. Set the peer's vxlan/bridge MTU to {_tapMtu} bytes. Forwarding it.");
+        }
+    }
+
+    /// <summary>True when the frame is an IP fragment (IPv4 MF/offset, or an IPv6 fragment header).</summary>
+    private static bool IsIpFragment(ReadOnlySpan<byte> frame)
+    {
+        if (frame.Length < Ethernet.HeaderLength)
+        {
+            return false;
+        }
+
+        ushort etherType = Ethernet.ReadEtherType(frame, out int l3);
+
+        if (etherType == Ethernet.Ipv4)
+        {
+            if (frame.Length < l3 + 8)
+            {
+                return false;
+            }
+
+            int fragmentField = (frame[l3 + 6] << 8) | frame[l3 + 7];
+            return (fragmentField & 0x3FFF) != 0; // MF or non-zero offset
+        }
+
+        if (etherType != Ethernet.Ipv6 || frame.Length < l3 + 40)
+        {
+            return false;
+        }
+
+        int nextHeader = frame[l3 + 6];
+        int offset = l3 + 40;
+
+        for (int hop = 0; hop < 4; hop++)
+        {
+            if (nextHeader == 44)
+            {
+                return true; // fragment header
+            }
+
+            if (nextHeader is not (0 or 43 or 60) || offset + 2 > frame.Length)
+            {
+                return false;
+            }
+
+            nextHeader = frame[offset];
+            offset += (frame[offset + 1] + 1) * 8;
+            if (offset > frame.Length)
+            {
+                return false;
+            }
+        }
+
+        return false;
+    }
 
     private void OnLoopDetected()
     {

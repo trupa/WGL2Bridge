@@ -18,6 +18,7 @@ public sealed class VxlanTransport : IBridgeTransport
     private readonly int _vni;
     private readonly int _destinationPort;
     private readonly bool _validatePeerSource;
+    private readonly bool _allowFragmentation;
     private readonly byte[] _header = new byte[8];
     private readonly IPEndPoint _remote = new(IPAddress.Any, 0);
     private Socket? _socket;
@@ -30,6 +31,7 @@ public sealed class VxlanTransport : IBridgeTransport
         _vni = config.VxlanVni;
         _destinationPort = config.VxlanDestinationPort;
         _validatePeerSource = config.PeerSourceValidation;
+        _allowFragmentation = config.AllowFragmentation;
     }
 
     public TransportMode Mode => TransportMode.Vxlan;
@@ -54,6 +56,7 @@ public sealed class VxlanTransport : IBridgeTransport
     public void Open(IPAddress localTunnelIp, IPAddress? peerIp)
     {
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        SocketTuning.ApplyFragmentPolicy(_socket, _allowFragmentation);
         _socket.Bind(new IPEndPoint(localTunnelIp, _destinationPort));
         _peer = peerIp is null ? null : new IPEndPoint(peerIp, _destinationPort);
         LastReceiveSource = null;
