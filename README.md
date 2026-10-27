@@ -266,32 +266,39 @@ WireGuard adapter name and `peerAddress` to the peer's tunnel IP, and leave `pee
 - logMaxBytes (integer, default: 10485760)
   - Maximum size in bytes for the log file before rotation. When the file reaches this size it is rotated to `wgl2bridge.log.1` and a fresh file is started. Set to a larger value for long-term retention or smaller for low-disk-space environments.
 
-Every filter key is a **list of values to drop, named after the frame field it matches**. There is no on/off flag and no grouping by concept, so a value can never be filed under the wrong idea: `null` (or omitted) means "use the built-in default set", an explicit array replaces that set, and `[]` means the key drops nothing.
+Every filter key is a **list of values to drop, named after the frame field it matches**. There is no on/off flag and no grouping by concept, so a value can never be filed under the wrong idea.
 
-- dropLinkLocalMacs (array of strings|null, default: null ⇒ `["01:80:C2:00:00:00-0F", "01:00:0C:CC:CC:CC", "01:00:0C:CC:CC:CD"]`)
-  - **Destination MACs.** The default covers the IEEE 802.1 reserved group `01:80:C2:00:00:00`–`0F` (STP/RSTP/MSTP, LACP, 802.1X/EAPOL, 802.3x PAUSE, slow protocols) and Cisco `01:00:0C:CC:CC:CC`/`CC:CD` (CDP, VTP, DTP, UDLD, PVST+, PAgP). These frames carry no EtherType, so destination MAC is the only handle. Entries are single MACs or last-octet ranges such as `"01:80:C2:00:00:10-1F"`.
-  - Forwarding most of these has legitimate uses (one STP domain across a stable underlay, centralized 802.1X, VTP/CDP in a single management domain), so the list is configurable. **One exception: 802.3x PAUSE (`01:80:C2:00:00:01`) is always dropped** — 802.3 does not allow bridges to forward MAC Control frames, and a forwarded PAUSE would stall the far segment. When the list no longer drops the STP MAC, startup warns that loop detection is then the only cross-site loop guard.
+**The code carries no filter defaults of its own** — a missing key or `null` means "drop nothing". The recommended values ship in the `appsettings.json` below; edit or delete them freely. The only filtering that is not configurable is protocol conformance (see `dropLinkLocalMacs`).
 
-- dropEtherTypes (array of strings|null, default: null ⇒ `[]`)
-  - **EtherType**, as hexadecimal text with an optional `0x` prefix (e.g. `"0x88CC"` blocks LLDP). Matched on the frame's inner EtherType after any VLAN tags.
+- dropLinkLocalMacs (array of strings|null, default: none)
+  - **Destination MACs.** The shipped config covers the IEEE 802.1 reserved group `01:80:C2:00:00:00`–`0F` (STP/RSTP/MSTP, LACP, 802.1X/EAPOL, 802.3x PAUSE, slow protocols) and Cisco `01:00:0C:CC:CC:CC`/`CC:CD` (CDP, VTP, DTP, UDLD, PVST+, PAgP). These frames carry no EtherType, so destination MAC is the only handle. Entries are single MACs or last-octet ranges such as `"01:80:C2:00:00:10-1F"`.
+  - Forwarding most of these has legitimate uses (one STP domain across a stable underlay, centralized 802.1X, VTP/CDP in a single management domain), which is why the list is configurable. **One exception: 802.3x PAUSE (`01:80:C2:00:00:01`) is always dropped in code** — 802.3 does not allow bridges to forward MAC Control frames, and a forwarded PAUSE would stall the far segment. When the list no longer drops the STP MAC, startup warns that loop detection is then the only cross-site loop guard.
 
-- dropIpProtocols (array of integers|null, default: null ⇒ `[2, 88, 89, 103, 112]`)
-  - **IANA IP protocol number**, applied to IPv4 and to the final IPv6 next-header. The default set is IGMP 2, EIGRP 88, OSPF 89, PIM 103 (routing/multicast control must not converge across the tunnel) and VRRP/CARP 112 (gateway hellos can hand a site's VIP to the other end).
+- dropEtherTypes (array of strings|null, default: none)
+  - **EtherType**, as hexadecimal text with an optional `0x` prefix. Matched on the frame's inner EtherType after any VLAN tags. The shipped config blocks two that should never cross a bridge:
+    - **`0x8808` — MAC Control** (PAUSE already goes by destination MAC, but this also covers priority flow control `0x0101` and any future opcode). 802.3 does not let bridges forward MAC Control frames.
+    - **`0x9000` — Ethernet Configuration Testing Protocol** (loopback test frames). A link-test protocol with no meaning across a tunnel.
+  - Add `0x88CC` if you also want to block LLDP (already covered by `dropLinkLocalMacs`), or `0x88F7` to block IEEE 1588 PTP over L2 (timing across a WAN tunnel is actively harmful).
 
-- dropUdpPorts (array of integers|null, default: null ⇒ `[5353, 5355, 1900, 3702, 137, 138, 17500, 27036, 1985, 3222]`)
-  - **UDP destination port.** The default set is consumer discovery (mDNS 5353, LLMNR 5355, SSDP 1900, WS-Discovery 3702, NetBIOS 137/138, Dropbox 17500, Steam 27036) plus gateway redundancy (HSRP 1985, GLBP 3222). To keep one of them, list the rest explicitly — the list is what gets dropped.
+- dropIpProtocols (array of integers|null, default: none)
+  - **IANA IP protocol number**, applied to IPv4 and to the final IPv6 next-header. The shipped config blocks IGMP 2, EIGRP 88, OSPF 89, PIM 103 (routing/multicast control must not converge across the tunnel) and VRRP/CARP 112 (gateway hellos can hand a site's VIP to the other end). `[]` forwards all of them, matching a kernel VXLAN peer.
 
-- dropTcpPorts (array of integers|null, default: null ⇒ `[]`)
-  - **TCP destination port**, empty by default (all TCP passes). Useful to block specific services across the tunnel (445, 3389, …). When empty, the TCP path skips the lookup entirely.
+- dropUdpPorts (array of integers|null, default: none)
+  - **UDP destination port.** The shipped config blocks consumer discovery (mDNS 5353, LLMNR 5355, SSDP 1900, WS-Discovery 3702, NetBIOS 137/138, Dropbox 17500, Steam 27036) plus gateway redundancy (HSRP 1985, GLBP 3222). To keep one of them, list the rest explicitly — the list is what gets dropped.
 
-- dropIcmpv4Types (array of integers|null, default: null ⇒ `[]`)
-  - **ICMPv4 type**, empty by default. Worth considering: `5` (redirect) and `9`/`10` (router advertisement/solicitation) — the IPv4 equivalent of an RA crossing sites.
+- dropTcpPorts (array of integers|null, default: none)
+  - **TCP destination port**, empty in the shipped config (all TCP passes). Useful to block specific services across the tunnel (445, 3389, …). When empty, the TCP path skips the lookup entirely.
 
-- dropIcmpv6Types (array of integers|null, default: null ⇒ `[]`)
-  - **ICMPv6 type**, empty by default because an extended segment may legitimately have one IPv6 router. Set `[133, 134]` (Router Solicitation/Advertisement) when each site runs its own — otherwise an RA from the far site installs a foreign prefix and default router on local hosts.
+- dropIcmpv4Types (array of integers|null, default: none)
+  - **ICMPv4 type**, empty in the shipped config. Worth considering: `5` (redirect) and `9`/`10` (router advertisement/solicitation) — the IPv4 equivalent of an RA crossing sites.
+
+- dropIcmpv6Types (array of integers|null, default: none)
+  - **ICMPv6 type**, empty in the shipped config because an extended segment may legitimately have one IPv6 router. Set `[133, 134]` (Router Solicitation/Advertisement) when each site runs its own — otherwise an RA from the far site installs a foreign prefix and default router on local hosts.
 
 - allowVlans (array of integers|null, default: null)
   - When set to one or more VLAN IDs, only frames tagged with one of those IDs are forwarded; untagged frames and frames with any other tag are dropped. When null (or an empty array) all VLANs are allowed and VLAN tags are preserved across encapsulation.
+
+**Want parity with a kernel VXLAN peer?** Set `dropIpProtocols: []`, `dropUdpPorts: []` and `dropLinkLocalMacs: ["01:80:C2:00:00:00-0F"]` (the Cisco MACs are not in the 802.1 reserved group, so a Linux bridge forwards them). PAUSE stays dropped — a Linux bridge doesn't forward it either.
 
 - netbirdCliPath (string|null, default: null)
   - Optional explicit path to the `netbird.exe` CLI used for discovery and status checks. When null the bridge searches PATH and common install directories. If the CLI cannot be found NetBird-based discovery is unavailable and the resolver falls back to the configured `peerAddress` (if provided). The CLI is only consulted when discovery is required (see the note under `peerName`).
@@ -320,20 +327,22 @@ Run with a custom config path: `WGL2Bridge.exe path\to\config.json`.
 ## Filter policy
 
 Frames are forwarded by default (fail-open); restriction is opt-in. Every key names **the frame
-field it matches**, so a value can only ever be in the list for the field it belongs to. `null` (or
-omitted) selects the built-in default set, an explicit array replaces it, `[]` drops nothing. All
-lists apply in both directions (TAP→tunnel and tunnel→TAP), and the effective policy is logged once
-per start:
+field it matches**, so a value can only ever be in the list for the field it belongs to. An explicit
+array is the set; a missing key or `null` means **nothing is dropped**. All lists apply in both
+directions (TAP→tunnel and tunnel→TAP), and the effective policy is logged once per start:
 
 ```
 Filter: link-local=drop(18 macs) ip=drop(5 protocols) udp=drop(10 ports) tcp=none
-        icmpv4=none icmpv6=none ethertype=none vlans=all.
+        icmpv4=none icmpv6=none ethertype=drop(2 types) vlans=all.
 ```
 
-| Key | Field | Built-in set (`null` ⇒ this) | Why those defaults |
+**No filter defaults live in the code.** What ships in `appsettings.json` is a recommendation, not a
+fallback — delete a key and that filtering simply stops.
+
+| Key | Field | Recommended value (shipped) | Why |
 | --- | --- | --- | --- |
-| `dropLinkLocalMacs` | destination MAC | `01:80:C2:00:00:00-0F`, `01:00:0C:CC:CC:CC`, `01:00:0C:CC:CC:CD` (PAUSE `…:01` always dropped) | STP/RSTP/MSTP, LACP, EAPOL, PAUSE, CDP/VTP/DTP/UDLD/PVST+/PAgP are per-link; bridging them makes the far switch root, or block its own uplinks, for a topology it should not see. Clear the list only for a deliberate single-domain design — startup then warns that loop detection is the only guard |
-| `dropEtherTypes` | EtherType | none | opt-in (e.g. `0x88CC` LLDP) |
+| `dropLinkLocalMacs` | destination MAC | `01:80:C2:00:00:00-0F`, `01:00:0C:CC:CC:CC`, `01:00:0C:CC:CC:CD` (PAUSE `…:01` always dropped in code) | STP/RSTP/MSTP, LACP, EAPOL, PAUSE, CDP/VTP/DTP/UDLD/PVST+/PAgP are per-link; bridging them makes the far switch root, or block its own uplinks, for a topology it should not see. Clear the list only for a deliberate single-domain design — startup then warns that loop detection is the only guard |
+| `dropEtherTypes` | EtherType | `0x8808` (MAC Control: PAUSE/PFC), `0x9000` (Ethernet Configuration Testing) | neither may cross a bridge: 802.3 forbids forwarding MAC Control frames, and ECP is a link-local loopback test. Options: `0x88CC` LLDP, `0x88F7` PTP, `0x8906`/`0x8914` FCoE/FIP, `0x22F3` TRILL, `0x88E7` PBB |
 | `dropIpProtocols` | IP protocol number | `2, 88, 89, 103, 112` | IGMP/EIGRP/OSPF/PIM adjacencies, querier elections and RPF state across the tunnel (PIM can blackhole multicast for both segments) + VRRP/CARP, whose hellos can hand a site's gateway VIP to a router on the other end |
 | `dropUdpPorts` | UDP destination port | `5353, 5355, 1900, 3702, 137, 138, 17500, 27036, 1985, 3222` | consumer discovery chatter (mDNS/LLMNR/SSDP/WS-Discovery/NetBIOS/Dropbox/Steam) + HSRP/GLBP gateway hellos |
 | `dropTcpPorts` | TCP destination port | none | opt-in (block a service across the tunnel, e.g. 445/3389) |
@@ -341,8 +350,8 @@ Filter: link-local=drop(18 macs) ip=drop(5 protocols) udp=drop(10 ports) tcp=non
 | `dropIcmpv6Types` | ICMPv6 type | none | opt-in; `[133, 134]` when each site has its own IPv6 router, otherwise an RA from the far site installs a foreign prefix and default router on local hosts |
 | `allowVlans` | VLAN ID (allow-list) | `null` ⇒ all VLANs pass | — |
 
-`dropTcpPorts`, `dropIcmpv4Types` and `dropIcmpv6Types` are empty by default and their lookups are
-skipped entirely while empty, so they cost nothing until configured.
+`dropTcpPorts`, `dropIcmpv4Types` and `dropIcmpv6Types` ship empty and their lookups are skipped
+entirely while empty, so they cost nothing until configured.
 
 Do not list the loop-probe EtherType `0x88B5` anywhere: blocking it disables loop detection, and the
 far end must not drop it either — a loop through the tunnel is only detected if the probe can travel

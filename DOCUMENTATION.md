@@ -535,21 +535,19 @@ rejected a frame. Every lookup is a pre-built table or `HashSet` — O(1) and al
 #### `FilterPolicy` (`Network/FilterPolicy.cs`)
 
 `public sealed class FilterPolicy` — the effective policy: one plain list per frame field, so a value
-can only be in the list for the field it belongs to. Config semantics: `null` means the built-in
-default set, an explicit array replaces it, `[]` means "drop nothing" — there is no separate
-enable/disable flag and no concept grouping.
-One rule is not configurable: **802.3x PAUSE (`01:80:C2:00:00:01`) is always dropped**, because 802.3
-does not allow bridges to forward MAC Control frames. `CollectWarnings` reports a destination-MAC list
-that no longer drops STP BPDUs, since cross-site loop protection then rests solely on `LoopDetector`.
+can only be in the list for the field it belongs to. An explicit array is the set; a missing key or
+`null` means **drop none**. **There are no filter defaults in code** — the shipped `appsettings.json`
+carries the recommended values, and deleting a key simply disables that filtering.
+One rule is not configurable because it is protocol conformance, not policy: **802.3x PAUSE
+(`01:80:C2:00:00:01`) is always dropped**, as 802.3 does not allow bridges to forward MAC Control
+frames. `CollectWarnings` reports a destination-MAC list that no longer drops STP BPDUs, since
+cross-site loop protection then rests solely on `LoopDetector`.
 
 | Member | Kind | Description |
 | ------ | ---- | ----------- |
 | `FilterDropReason` | enum | `None`, `LinkLocal`, `Vlan`, `EtherType`, `IpProtocol`, `UdpPort`, `TcpPort`, `Icmpv4Type`, `Icmpv6Type`. |
 | `FilterDrop` | `readonly record struct` | `(FilterDropReason Reason, ulong Value)` — the field that matched and the exact value; `FilterDrop.None` for a forwarded frame. |
-| `DefaultLinkLocalMacs` | `string[]` | `01:80:C2:00:00:00-0F`, Cisco `01:00:0C:CC:CC:CC`/`CC:CD`. |
-| `DefaultIpProtocols` | `int[]` | `2, 88, 89, 103, 112` (IGMP/EIGRP/OSPF/PIM + VRRP/CARP). |
-| `DefaultUdpPorts` | `int[]` | The eight discovery ports plus HSRP `1985` and GLBP `3222`. |
-| `Resolve(config, errors?)` | `static FilterPolicy` | Builds the tables and the configured-value arrays, honouring null ⇒ built-in / array ⇒ replacement / empty ⇒ none; always adds the PAUSE MAC; appends validation errors (invalid ports, protocols, ICMP types, EtherTypes, VLANs, MAC ranges). Called by `BridgeConfig.Validate`. |
+| `Resolve(config, errors?)` | `static FilterPolicy` | Builds the tables and the configured-value arrays from the config lists (a missing list means "drop none"); always adds the PAUSE MAC; appends validation errors (invalid ports, protocols, ICMP types, EtherTypes, VLANs, MAC ranges). Called by `BridgeConfig.Validate`. |
 | `CollectWarnings(config, warnings)` | `static void` | Warns when `DropLinkLocalMacs` no longer drops the STP MAC (loop detection becomes the only cross-site guard). Called by `BridgeConfig.GetWarnings`. |
 | `Description` | `string` | One-line effective-policy summary logged once at session start. |
 | `…Values` properties | `int[]` / `ushort[]` / `ulong[]` | The configured values in configuration order; the bridge sizes one counter per entry from these and names metrics after them. |
@@ -919,10 +917,10 @@ is logged at `Debug` and the OS default applies. Called from `VxlanTransport.Ope
 | `fileLogLevel` | LogLevel | `"Debug"` | Minimum file level. |
 | `logFilePath` | string | `"wgl2bridge.log"` | Plain-text log path. |
 | `logMaxBytes` | long | `10485760` | Rotation threshold. |
-| `dropEtherTypes` | string[]? | `null` | EtherTypes to drop (hex text); null/`[]` ⇒ none. |
-| `dropLinkLocalMacs` | string[]? | `null` | Destination MACs; null ⇒ `01:80:C2:00:00:00-0F` + Cisco CDP/PVST+ MACs; array ⇒ exactly those; `[]` ⇒ none (PAUSE always dropped). |
-| `dropIpProtocols` | int[]? | `null` | IP protocol numbers; null ⇒ `[2,88,89,103,112]`. |
-| `dropUdpPorts` | int[]? | `null` | UDP destination ports; null ⇒ the eight discovery ports + `[1985,3222]`. |
+| `dropEtherTypes` | string[]? | `null` | EtherTypes to drop (hex text); null/`[]` ⇒ none. Shipped: `0x8808` (MAC Control — 802.3 forbids forwarding it) and `0x9000` (Ethernet Configuration Testing Protocol). |
+| `dropLinkLocalMacs` | string[]? | `null` | Destination MACs to drop; null/absent ⇒ none (PAUSE always dropped). |
+| `dropIpProtocols` | int[]? | `null` | IP protocol numbers to drop; null/absent ⇒ none. |
+| `dropUdpPorts` | int[]? | `null` | UDP destination ports to drop; null/absent ⇒ none. |
 | `dropTcpPorts` | int[]? | `null` | TCP destination ports; null/`[]` ⇒ none (lookup skipped). |
 | `dropIcmpv4Types` | int[]? | `null` | ICMPv4 types; null/`[]` ⇒ none; e.g. `[5]` for redirects. |
 | `dropIcmpv6Types` | int[]? | `null` | ICMPv6 types; null/`[]` ⇒ none; `[133,134]` drops Router Solicitation/Advertisement. |
@@ -996,26 +994,28 @@ Consequences implemented in `Bridge`:
 ## 10. Filtering & forwarding policy
 
 Applied by `FrameFilter.Allow` in **both** directions. Each check is a single field, so the drop is
-always attributable to one configured value:
+always attributable to one configured value. Every list is empty unless the config sets it — the code
+holds no filter defaults:
 
 1. **Truncated frame** (`< 14` bytes) → forward (fail-open).
-2. **Destination MAC** (`dropLinkLocalMacs`, default the 802.1 reserved group `01:80:C2:00:00:00`–`0F`
-   + Cisco `01:00:0C:CC:CC:CC`/`CC:CD`) → match drops the frame. These are 802.3/LLC frames with no
-   EtherType, so no other check can catch them. 802.3x PAUSE (`…:01`) is dropped even when the list is
-   cleared. Clearing the list forwards BPDUs, which startup reports as a warning because
-   `LoopDetector` is then the only cross-site loop guard.
+2. **Destination MAC** (`dropLinkLocalMacs`) → match drops the frame. These are 802.3/LLC frames with
+   no EtherType, so no other check can catch them. 802.3x PAUSE (`01:80:C2:00:00:01`) is dropped
+   unconditionally, even when the list is empty, because 802.3 does not let bridges forward MAC
+   Control frames. Omitting the STP MAC from the list forwards BPDUs, which startup reports as a
+   warning because `LoopDetector` is then the only cross-site loop guard.
 3. **VLAN allow list** (if configured) → the frame must carry an allowed 802.1Q/QinQ tag; untagged
    frames are dropped. If not configured, all VLANs (and untagged) pass.
-4. **EtherType** (`dropEtherTypes`) → inner EtherType match drops the frame.
-5. **IP protocol number** (`dropIpProtocols`, default `2/88/89/103/112`) → checked on IPv4 and on the
-   final IPv6 next-header, so routing/multicast-control convergence and VRRP/CARP cannot span the
-   tunnel.
-6. **ICMPv6 type** (`dropIcmpv6Types`, empty by default) → `[133,134]` drops Router
-   Solicitation/Advertisement.
-7. **ICMPv4 type** (`dropIcmpv4Types`, empty by default; only when configured).
-8. **TCP / UDP destination port** (`dropTcpPorts` / `dropUdpPorts`, the latter defaulting to the eight
-   discovery ports + HSRP/GLBP) → later fragments and truncated transport headers pass. The TCP
-   lookup is skipped entirely while `dropTcpPorts` is empty.
+4. **EtherType** (`dropEtherTypes`) → inner EtherType match drops the frame. The shipped config blocks
+   `0x8808` (MAC Control: PAUSE, priority flow control and future opcodes — 802.3 does not allow
+   bridges to forward MAC Control frames) and `0x9000` (Ethernet Configuration Testing Protocol, a
+   link-local loopback test). CTFs, FCoE/FIP, TRILL and PBB (`0x8906`, `0x8914`, `0x22F3`, `0x88E7`)
+   are encapsulated fabric protocols and are candidates for the same list when present.
+5. **IP protocol number** (`dropIpProtocols`) → checked on IPv4 and on the final IPv6 next-header, so
+   routing/multicast-control convergence and VRRP/CARP cannot span the tunnel when configured.
+6. **ICMPv6 type** (`dropIcmpv6Types`) → `[133,134]` drops Router Solicitation/Advertisement.
+7. **ICMPv4 type** (`dropIcmpv4Types`; only when configured).
+8. **TCP / UDP destination port** (`dropTcpPorts` / `dropUdpPorts`) → later fragments and truncated
+   transport headers pass. The TCP lookup is skipped entirely while `dropTcpPorts` is empty.
 9. **Everything else** (other ICMP types, GRE, unrecognized EtherTypes, …) → forwards.
 
 Every drop is reported as a `FilterDrop(Reason, Value)` and charged to a counter generated for that

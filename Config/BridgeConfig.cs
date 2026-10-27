@@ -191,41 +191,40 @@ public sealed record BridgeConfig
     public string[]? DropEtherTypes { get; init; }
 
     /// <summary>
-    /// Destination MACs to drop as link-local control protocols. <c>null</c> = built-in set (IEEE
-    /// 802.1 reserved group 01:80:C2:00:00:00-0F: STP/RSTP/MSTP, LACP, 802.1X/EAPOL, 802.3x PAUSE,
-    /// slow protocols; plus Cisco 01:00:0C:CC:CC:CC/CC:CD: CDP, VTP, DTP, UDLD, PVST+, PAgP),
-    /// explicit array = exactly these, <c>[]</c> = none. Entries are single MACs or last-octet ranges
-    /// (e.g. "01:80:C2:00:00:10-1F"). Exception: 802.3x PAUSE (01:80:C2:00:00:01) is always dropped
-    /// because 802.3 does not allow bridges to forward MAC Control frames. Emptying the list forwards
-    /// BPDUs, so startup warns that loop detection is then the only guard.
+    /// Destination MACs to drop as link-local control protocols, e.g. the IEEE 802.1 reserved group
+    /// 01:80:C2:00:00:00-0F (STP/RSTP/MSTP, LACP, 802.1X/EAPOL, 802.3x PAUSE, slow protocols) or the
+    /// Cisco discovery/STP MACs. There is no built-in default: null/absent drops none. Exception:
+    /// 802.3x PAUSE (01:80:C2:00:00:01) is always dropped because 802.3 does not allow bridges to
+    /// forward MAC Control frames. Entries are single MACs or last-octet ranges (e.g.
+    /// "01:80:C2:00:00:10-1F").
     /// </summary>
     public string[]? DropLinkLocalMacs { get; init; }
 
     /// <summary>
-    /// IP protocol numbers to drop (IANA): null = built-in set (IGMP 2, EIGRP 88, OSPF 89, PIM 103,
-    /// VRRP/CARP 112), explicit array = exactly these, [] = drop none.
+    /// IP protocol numbers to drop (IANA), e.g. IGMP 2, EIGRP 88, OSPF 89, PIM 103, VRRP/CARP 112.
+    /// There is no built-in default: null/absent drops none.
     /// </summary>
     public int[]? DropIpProtocols { get; init; }
 
     /// <summary>
-    /// UDP destination ports to drop: null = built-in set (consumer discovery: mDNS 5353, LLMNR 5355,
-    /// SSDP 1900, WS-Discovery 3702, NetBIOS 137/138, Dropbox 17500, Steam 27036; gateway redundancy:
-    /// HSRP 1985, GLBP 3222), explicit array = exactly these, [] = drop none.
+    /// UDP destination ports to drop, e.g. the consumer-discovery ports (mDNS 5353, LLMNR 5355, SSDP
+    /// 1900, WS-Discovery 3702, NetBIOS 137/138, Dropbox 17500, Steam 27036) or gateway redundancy
+    /// (HSRP 1985, GLBP 3222). There is no built-in default: null/absent drops none.
     /// </summary>
     public int[]? DropUdpPorts { get; init; }
 
-    /// <summary>TCP destination ports to drop; null/[] = drop none.</summary>
+    /// <summary>TCP destination ports to drop; null/absent drops none.</summary>
     public int[]? DropTcpPorts { get; init; }
 
     /// <summary>
-    /// ICMPv4 types to drop; null/[] = drop none. Worth blocking across a tunnel: 5 (redirect) and
+    /// ICMPv4 types to drop; null/absent drops none. Worth blocking across a tunnel: 5 (redirect) and
     /// 9/10 (router advertisement/solicitation).
     /// </summary>
     public int[]? DropIcmpv4Types { get; init; }
 
     /// <summary>
-    /// ICMPv6 types to drop; null/[] = drop none, because an extended segment may legitimately have
-    /// one IPv6 router. Set [133, 134] (Router Solicitation/Advertisement) when each site runs its own.
+    /// ICMPv6 types to drop; null/absent drops none. Set [133, 134] (Router
+    /// Solicitation/Advertisement) when each site runs its own IPv6 router.
     /// </summary>
     public int[]? DropIcmpv6Types { get; init; }
 

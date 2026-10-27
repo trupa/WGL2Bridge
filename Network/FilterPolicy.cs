@@ -29,8 +29,11 @@ public readonly record struct FilterDrop(FilterDropReason Reason, ulong Value)
 /// never be filed under the wrong concept: a UDP port in a "consumer discovery" list and one in a
 /// "gateway redundancy" list are the same list here.
 /// <para>
-/// Each list is <c>null</c> for the built-in default set, an explicit array replaces it, and an empty
-/// array means "drop nothing". One entry is not configurable: 802.3x PAUSE
+/// Each list is simply the set of values to drop: an explicit array is the set, and a missing key or
+/// <c>null</c> means "drop none". There are no built-in defaults in code — the shipped
+/// <c>appsettings.json</c> carries the recommended values.
+/// <para>
+/// One entry is not configurable: 802.3x PAUSE
 /// (<c>01:80:C2:00:00:01</c>) is always dropped, because 802.3 does not let bridges forward MAC
 /// Control frames.
 /// </para>
@@ -39,27 +42,6 @@ public readonly record struct FilterDrop(FilterDropReason Reason, ulong Value)
 /// </summary>
 public sealed class FilterPolicy
 {
-    /// <summary>
-    /// IEEE 802.1 reserved group (STP/RSTP/MSTP, LACP, 802.1X/EAPOL, 802.3x PAUSE, slow protocols)
-    /// plus Cisco CDP/VTP/DTP/UDLD (01:00:0C:CC:CC:CC) and PVST+/PAgP (01:00:0C:CC:CC:CD).
-    /// </summary>
-    public static readonly string[] DefaultLinkLocalMacs =
-    [
-        "01:80:C2:00:00:00-0F",
-        "01:00:0C:CC:CC:CC",
-        "01:00:0C:CC:CC:CD",
-    ];
-
-    /// <summary>IGMP 2, EIGRP 88, OSPF 89, PIM 103, VRRP/CARP 112.</summary>
-    public static readonly int[] DefaultIpProtocols = [2, 88, 89, 103, 112];
-
-    /// <summary>
-    /// Consumer discovery (mDNS 5353, LLMNR 5355, SSDP 1900, WS-Discovery 3702, NetBIOS 137/138,
-    /// Dropbox 17500, Steam 27036) plus gateway redundancy (HSRP 1985, GLBP 3222).
-    /// </summary>
-    public static readonly int[] DefaultUdpPorts =
-        [5353, 5355, 1900, 3702, 137, 138, 17500, 27036, 1985, 3222];
-
     /// <summary>MAC Control PAUSE (<c>01:80:C2:00:00:01</c>) — never forwarded, not configurable.</summary>
     private const ulong MacControlPauseMac = 0x0180_C200_0001UL;
 
@@ -153,7 +135,7 @@ public sealed class FilterPolicy
         // 802.3x PAUSE is the one entry that is not configurable: bridges do not forward MAC Control
         // frames, and a forwarded PAUSE would stall the far segment's transmit queue.
         HashSet<ulong> linkLocalMacs = [MacControlPauseMac];
-        foreach (string text in config.DropLinkLocalMacs ?? DefaultLinkLocalMacs)
+        foreach (string text in config.DropLinkLocalMacs ?? [])
         {
             if (!TryParseMacList(text, linkLocalMacs))
             {
@@ -182,10 +164,10 @@ public sealed class FilterPolicy
         }
 
         (bool[] ipProtocols, int[] ipProtocolValues) = BuildByteTable(
-            config.DropIpProtocols ?? DefaultIpProtocols, "DropIpProtocols", "IP protocol", errors);
+            config.DropIpProtocols ?? [], "DropIpProtocols", "IP protocol", errors);
 
         (bool[] udpPorts, int[] udpPortValues) = BuildPortTable(
-            config.DropUdpPorts ?? DefaultUdpPorts, "DropUdpPorts", errors);
+            config.DropUdpPorts ?? [], "DropUdpPorts", errors);
 
         (bool[] tcpPorts, int[] tcpPortValues) = BuildPortTable(
             config.DropTcpPorts ?? [], "DropTcpPorts", errors);
@@ -258,7 +240,7 @@ public sealed class FilterPolicy
     public static void CollectWarnings(BridgeConfig config, List<string> warnings)
     {
         HashSet<ulong> macs = [MacControlPauseMac];
-        foreach (string text in config.DropLinkLocalMacs ?? DefaultLinkLocalMacs)
+        foreach (string text in config.DropLinkLocalMacs ?? [])
         {
             TryParseMacList(text, macs);
         }
